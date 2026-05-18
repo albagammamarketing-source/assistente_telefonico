@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pandas
+requests
+icalendar
+pydantic
+python-dateutil
