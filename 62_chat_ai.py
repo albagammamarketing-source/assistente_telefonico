@@ -72,6 +72,7 @@ def get_booked_ranges(ical_url: str):
 
             if isinstance(start, datetime):
                 start = start.date()
+
             if isinstance(end, datetime):
                 end = end.date()
 
@@ -84,6 +85,7 @@ def is_available_from_ical(ical_url: str, check_in: date, check_out: date) -> bo
     for booked_start, booked_end in get_booked_ranges(ical_url):
         if check_in < booked_end and check_out > booked_start:
             return False
+
     return True
 
 
@@ -356,13 +358,18 @@ def send_booking_email(req: BookingEmailRequest):
     """
 
     email_response = resend.Emails.send({
-    "from": "onboarding@resend.dev",
-    "to": [req.email],
-    "subject": "Riepilogo prenotazione Janara",
-    "html": html
-})
+        "from": "onboarding@resend.dev",
+        "to": [req.email],
+        "subject": "Riepilogo prenotazione Janara",
+        "html": html
+    })
 
-print(email_response)
+    print(email_response)
+
+    return {
+        "success": True,
+        "message": f"Email inviata a {req.email}"
+    }
 
 
 if __name__ == "__main__":
