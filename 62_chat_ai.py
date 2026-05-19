@@ -41,7 +41,10 @@ class BookingEmailRequest(BaseModel):
 
 
 def google_sheet_csv_url(gid: str) -> str:
-    return f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export?format=csv&gid={gid}"
+    return (
+        f"https://docs.google.com/spreadsheets/d/"
+        f"{SPREADSHEET_ID}/export?format=csv&gid={gid}"
+    )
 
 
 def load_sheet(gid: str) -> pd.DataFrame:
@@ -139,7 +142,8 @@ def check_availability(req: AvailabilityRequest):
             "available": False,
             "message": "Le date devono essere nel formato YYYY-MM-DD.",
             "room_name": "",
-            "total_price": 0
+            "total_price": 0,
+            "url_camera": ""
         }
 
     if check_out <= check_in:
@@ -147,7 +151,8 @@ def check_availability(req: AvailabilityRequest):
             "available": False,
             "message": "La data di check-out deve essere successiva al check-in.",
             "room_name": "",
-            "total_price": 0
+            "total_price": 0,
+            "url_camera": ""
         }
 
     try:
@@ -157,7 +162,8 @@ def check_availability(req: AvailabilityRequest):
             "available": False,
             "message": f"Errore nel caricamento del foglio CAMERE_CONFIG: {str(e)}",
             "room_name": "",
-            "total_price": 0
+            "total_price": 0,
+            "url_camera": ""
         }
 
     camere.columns = [str(c).strip() for c in camere.columns]
@@ -180,7 +186,8 @@ def check_availability(req: AvailabilityRequest):
                 "available": False,
                 "message": f"Nel foglio CAMERE_CONFIG manca la colonna: {col}",
                 "room_name": "",
-                "total_price": 0
+                "total_price": 0,
+                "url_camera": ""
             }
 
     camere = camere[
@@ -200,18 +207,21 @@ def check_availability(req: AvailabilityRequest):
             "available": False,
             "message": f"Non ho trovato la struttura richiesta: {req.structure}. Puoi ripetere il nome?",
             "room_name": "",
-            "total_price": 0
+            "total_price": 0,
+            "url_camera": ""
         }
 
     disponibili = []
     disponibilita_per_camera_key = {}
 
+    # CAMERE STANDARD
     for _, camera in camere_struttura.iterrows():
         camera_key = str(camera["camera_key"]).strip()
         nome_camera = str(camera["nome_camera"]).strip()
         max_ospiti = int(camera["max_ospiti"])
         ical_url = str(camera["ical_url"]).strip()
         tipo_camera = str(camera.get("tipo_camera", "")).strip().lower()
+        url_camera = str(camera.get("url_airbnb", "")).strip()
 
         if req.guests > max_ospiti:
             disponibilita_per_camera_key[camera_key] = False
@@ -233,14 +243,14 @@ def check_availability(req: AvailabilityRequest):
             except Exception:
                 total_price = 0
 
-    
-  disponibili.append({
-    "room_name": nome_camera,
-    "camera_key": camera_key,
-    "total_price": total_price,
-    "url_camera": str(camera.get("url_airbnb", "")).strip()
-})
+            disponibili.append({
+                "room_name": nome_camera,
+                "camera_key": camera_key,
+                "total_price": total_price,
+                "url_camera": url_camera
+            })
 
+    # CAMERE COMBINATE
     camere_combinate = camere_struttura[
         camere_struttura["tipo_camera"].astype(str).str.lower().str.strip() == "combinata"
     ]
@@ -249,6 +259,7 @@ def check_availability(req: AvailabilityRequest):
         camera_key = str(camera["camera_key"]).strip()
         nome_camera = str(camera["nome_camera"]).strip()
         max_ospiti = int(camera["max_ospiti"])
+        url_camera = str(camera.get("url_airbnb", "")).strip()
 
         if req.guests > max_ospiti:
             continue
@@ -275,17 +286,19 @@ def check_availability(req: AvailabilityRequest):
                 total_price = 0
 
             disponibili.append({
-    "room_name": nome_camera,
-    "camera_key": camera_key,
-    "total_price": total_price,
-    "url_camera": str(camera.get("url_airbnb", "")).strip()
-})
+                "room_name": nome_camera,
+                "camera_key": camera_key,
+                "total_price": total_price,
+                "url_camera": url_camera
+            })
+
     if not disponibili:
         return {
             "available": False,
             "message": f"Mi dispiace, non risultano disponibilità dal {req.check_in} al {req.check_out} per {req.guests} ospiti.",
             "room_name": "",
-            "total_price": 0
+            "total_price": 0,
+            "url_camera": ""
         }
 
     migliore = sorted(disponibili, key=lambda x: x["total_price"])[0]
@@ -295,7 +308,8 @@ def check_availability(req: AvailabilityRequest):
         "message": f"Sì, abbiamo disponibilità per {migliore['room_name']}. Il prezzo totale dal {req.check_in} al {req.check_out} è {migliore['total_price']} euro.",
         "room_name": migliore["room_name"],
         "camera_key": migliore["camera_key"],
-        "total_price": migliore["total_price"]
+        "total_price": migliore["total_price"],
+        "url_camera": migliore["url_camera"]
     }
 
 
@@ -360,7 +374,7 @@ def send_booking_email(req: BookingEmailRequest):
     """
 
     email_response = resend.Emails.send({
-       "from": "Janara <onboarding@resend.dev>",
+        "from": "Janara <onboarding@resend.dev>",
         "to": [req.email],
         "subject": "Riepilogo prenotazione Janara",
         "html": html
