@@ -234,10 +234,12 @@ def check_availability(req: AvailabilityRequest):
                 total_price = 0
 
             disponibili.append({
-                "room_name": nome_camera,
-                "camera_key": camera_key,
-                "total_price": total_price
-            })
+               disponibili.append({
+    "room_name": nome_camera,
+    "camera_key": camera_key,
+    "total_price": total_price,
+    "url_camera": str(camera.get("url_airbnb", "")).strip()
+})
 
     camere_combinate = camere_struttura[
         camere_struttura["tipo_camera"].astype(str).str.lower().str.strip() == "combinata"
@@ -273,11 +275,11 @@ def check_availability(req: AvailabilityRequest):
                 total_price = 0
 
             disponibili.append({
-                "room_name": nome_camera,
-                "camera_key": camera_key,
-                "total_price": total_price
-            })
-
+    "room_name": nome_camera,
+    "camera_key": camera_key,
+    "total_price": total_price,
+    "url_camera": str(camera.get("url_airbnb", "")).strip()
+})
     if not disponibili:
         return {
             "available": False,
