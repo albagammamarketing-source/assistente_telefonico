@@ -356,7 +356,7 @@ def send_booking_email(req: BookingEmailRequest):
     """
 
     resend.Emails.send({
-        "from": "Janara <onboarding@resend.dev>",
+        "from": "onboarding@resend.dev",
         "to": req.email,
         "subject": "Riepilogo prenotazione Janara",
         "html": html
