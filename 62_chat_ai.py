@@ -355,17 +355,14 @@ def send_booking_email(req: BookingEmailRequest):
     </p>
     """
 
-    resend.Emails.send({
-        "from": "onboarding@resend.dev",
-        "to": req.email,
-        "subject": "Riepilogo prenotazione Janara",
-        "html": html
-    })
+    email_response = resend.Emails.send({
+    "from": "onboarding@resend.dev",
+    "to": [req.email],
+    "subject": "Riepilogo prenotazione Janara",
+    "html": html
+})
 
-    return {
-        "success": True,
-        "message": f"Email inviata a {req.email}"
-    }
+print(email_response)
 
 
 if __name__ == "__main__":
