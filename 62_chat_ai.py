@@ -233,8 +233,8 @@ def check_availability(req: AvailabilityRequest):
             except Exception:
                 total_price = 0
 
-            disponibili.append({
-               disponibili.append({
+    
+  disponibili.append({
     "room_name": nome_camera,
     "camera_key": camera_key,
     "total_price": total_price,
