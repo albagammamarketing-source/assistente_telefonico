@@ -23,7 +23,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 if RESEND_API_KEY:
     resend.api_key = RESEND_API_KEY
 
-RESEND_FROM = os.environ.get("RESEND_FROM", "Janara <info@janara.net.dev>")
+RESEND_FROM = os.environ.get("RESEND_FROM", "Janara <info@janara.net>")
 
 SPREADSHEET_ID = os.environ.get(
     "SPREADSHEET_ID",
