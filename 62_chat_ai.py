@@ -15,6 +15,7 @@ from icalendar import Calendar
 
 app = FastAPI(title="Janara Reception API")
 
+
 # =========================
 # CONFIGURAZIONE
 # =========================
@@ -23,6 +24,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 if RESEND_API_KEY:
     resend.api_key = RESEND_API_KEY
 
+# Mittente email corretto
 RESEND_FROM = os.environ.get("RESEND_FROM", "Janara <info@janara.net>")
 
 SPREADSHEET_ID = os.environ.get(
@@ -33,21 +35,16 @@ SPREADSHEET_ID = os.environ.get(
 GID_CAMERE_CONFIG = os.environ.get("GID_CAMERE_CONFIG", "0")
 GID_PREZZI = os.environ.get("GID_PREZZI", "415348027")
 
-# Timeout bassi: in chiamata vocale il webhook deve rispondere velocemente.
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "6"))
 
-# Cache temporanea per evitare di scaricare Google Sheet e iCal a ogni richiesta.
-SHEET_CACHE_SECONDS = int(os.environ.get("SHEET_CACHE_SECONDS", "300"))   # 5 minuti
-ICAL_CACHE_SECONDS = int(os.environ.get("ICAL_CACHE_SECONDS", "120"))     # 2 minuti
+SHEET_CACHE_SECONDS = int(os.environ.get("SHEET_CACHE_SECONDS", "300"))
+ICAL_CACHE_SECONDS = int(os.environ.get("ICAL_CACHE_SECONDS", "120"))
 
-# Numero massimo di calendari iCal controllati in parallelo.
 MAX_ICAL_WORKERS = int(os.environ.get("MAX_ICAL_WORKERS", "6"))
 
 
-# Sessione HTTP riutilizzata: più veloce di requests.get semplice ripetuto.
 http = requests.Session()
 
-# Cache semplici in memoria.
 _sheet_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
 _ical_cache: Dict[str, Tuple[float, List[Tuple[date, date]]]] = {}
 
@@ -107,11 +104,6 @@ def error_response(message: str) -> dict:
 
 
 def load_sheet(gid: str, use_cache: bool = True) -> pd.DataFrame:
-    """
-    Scarica un foglio Google in formato CSV.
-    Ottimizzazione: usa una cache in memoria per non scaricare lo stesso foglio
-    a ogni richiesta telefonica.
-    """
     now = time.time()
 
     if use_cache and gid in _sheet_cache:
@@ -119,7 +111,10 @@ def load_sheet(gid: str, use_cache: bool = True) -> pd.DataFrame:
         if now - cached_at <= SHEET_CACHE_SECONDS:
             return cached_df.copy()
 
-    response = http.get(google_sheet_csv_url(gid), timeout=REQUEST_TIMEOUT_SECONDS)
+    response = http.get(
+        google_sheet_csv_url(gid),
+        timeout=REQUEST_TIMEOUT_SECONDS
+    )
     response.raise_for_status()
 
     df = pd.read_csv(io.StringIO(response.text))
@@ -130,9 +125,6 @@ def load_sheet(gid: str, use_cache: bool = True) -> pd.DataFrame:
 
 
 def prepare_prices(prezzi: pd.DataFrame) -> pd.DataFrame:
-    """
-    Prepara il foglio prezzi una sola volta per richiesta.
-    """
     prezzi = prezzi.copy()
     prezzi.columns = [str(c).strip() for c in prezzi.columns]
 
@@ -152,10 +144,6 @@ def get_total_price_from_df(
     check_in: date,
     check_out: date
 ) -> float:
-    """
-    Calcola il prezzo totale usando il DataFrame prezzi già caricato.
-    Questo evita di scaricare il Google Sheet prezzi per ogni camera.
-    """
     camera_key = str(camera_key).strip()
 
     if camera_key not in prezzi.columns:
@@ -170,7 +158,6 @@ def get_total_price_from_df(
 
         price = prezzi.loc[current, camera_key]
 
-        # Se ci sono date duplicate nel foglio, pandas restituisce una Series.
         if isinstance(price, pd.Series):
             price = price.iloc[0]
 
@@ -184,10 +171,6 @@ def get_total_price_from_df(
 
 
 def get_booked_ranges(ical_url: str) -> List[Tuple[date, date]]:
-    """
-    Scarica e interpreta un calendario iCal.
-    Ottimizzazione: cache breve per evitare più download ravvicinati dello stesso calendario.
-    """
     ical_url = str(ical_url).strip()
     now = time.time()
 
@@ -230,9 +213,12 @@ def get_booked_ranges(ical_url: str) -> List[Tuple[date, date]]:
     return ranges
 
 
-def is_available_from_ical(ical_url: str, check_in: date, check_out: date) -> bool:
+def is_available_from_ical(
+    ical_url: str,
+    check_in: date,
+    check_out: date
+) -> bool:
     for booked_start, booked_end in get_booked_ranges(ical_url):
-        # Sovrapposizione date: se c'è overlap, la camera non è disponibile.
         if check_in < booked_end and check_out > booked_start:
             return False
 
@@ -266,11 +252,11 @@ def validate_camere_config(camere: pd.DataFrame) -> Optional[str]:
     return None
 
 
-def check_single_room_availability(row, check_in: date, check_out: date) -> Tuple[str, bool]:
-    """
-    Funzione usata dal controllo parallelo delle camere standard.
-    Ritorna camera_key e disponibilità True/False.
-    """
+def check_single_room_availability(
+    row,
+    check_in: date,
+    check_out: date
+) -> Tuple[str, bool]:
     camera_key = str(row["camera_key"]).strip()
     ical_url = str(row["ical_url"]).strip()
 
@@ -304,7 +290,6 @@ def health():
 
 @app.post("/check-availability")
 def check_availability(req: AvailabilityRequest):
-    # 1. Validazione date
     try:
         check_in = parse_date(req.check_in)
         check_out = parse_date(req.check_out)
@@ -317,31 +302,41 @@ def check_availability(req: AvailabilityRequest):
     if req.guests <= 0:
         return error_response("Il numero di ospiti deve essere maggiore di zero.")
 
-    # 2. Caricamento Google Sheet: una volta sola per richiesta
     try:
         camere = load_sheet(GID_CAMERE_CONFIG)
         prezzi = prepare_prices(load_sheet(GID_PREZZI))
     except Exception as e:
-        return error_response(f"Errore nel caricamento dei dati da Google Sheet: {str(e)}")
+        return error_response(
+            f"Errore nel caricamento dei dati da Google Sheet: {str(e)}"
+        )
 
-    # 3. Validazione colonne CAMERE_CONFIG
     camere.columns = [str(c).strip() for c in camere.columns]
+
     config_error = validate_camere_config(camere)
     if config_error:
         return error_response(config_error)
 
-    # 4. Filtra solo camere attive
     camere = camere[
         camere["attiva"].astype(str).str.upper().str.strip() == "SI"
     ].copy()
 
     struttura_request = normalize(req.structure)
 
-    # regex=False evita problemi se nel nome struttura ci sono caratteri speciali.
     camere_struttura = camere[
-        camere["nome_struttura"].astype(str).str.lower().str.contains(struttura_request, na=False, regex=False)
-        | camere["struttura_key"].astype(str).str.lower().str.contains(struttura_request, na=False, regex=False)
-        | camere["citta"].astype(str).str.lower().str.contains(struttura_request, na=False, regex=False)
+        camere["nome_struttura"]
+        .astype(str)
+        .str.lower()
+        .str.contains(struttura_request, na=False, regex=False)
+        |
+        camere["struttura_key"]
+        .astype(str)
+        .str.lower()
+        .str.contains(struttura_request, na=False, regex=False)
+        |
+        camere["citta"]
+        .astype(str)
+        .str.lower()
+        .str.contains(struttura_request, na=False, regex=False)
     ].copy()
 
     if camere_struttura.empty:
@@ -352,16 +347,20 @@ def check_availability(req: AvailabilityRequest):
     disponibili = []
     disponibilita_per_camera_key: Dict[str, bool] = {}
 
-    # 5. Separa camere standard e camere combinate
     camere_standard = camere_struttura[
-        camere_struttura["tipo_camera"].astype(str).str.lower().str.strip() != "combinata"
+        camere_struttura["tipo_camera"]
+        .astype(str)
+        .str.lower()
+        .str.strip() != "combinata"
     ].copy()
 
     camere_combinate = camere_struttura[
-        camere_struttura["tipo_camera"].astype(str).str.lower().str.strip() == "combinata"
+        camere_struttura["tipo_camera"]
+        .astype(str)
+        .str.lower()
+        .str.strip() == "combinata"
     ].copy()
 
-    # 6. Filtra camere standard per numero ospiti prima di scaricare gli iCal
     camere_standard_ok = []
 
     for _, camera in camere_standard.iterrows():
@@ -374,13 +373,17 @@ def check_availability(req: AvailabilityRequest):
 
         camere_standard_ok.append(camera)
 
-    # 7. Controlla gli iCal in parallelo, non uno dopo l'altro
     if camere_standard_ok:
         workers = min(MAX_ICAL_WORKERS, len(camere_standard_ok))
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_map = {
-                executor.submit(check_single_room_availability, camera, check_in, check_out): camera
+                executor.submit(
+                    check_single_room_availability,
+                    camera,
+                    check_in,
+                    check_out
+                ): camera
                 for camera in camere_standard_ok
             }
 
@@ -408,7 +411,6 @@ def check_availability(req: AvailabilityRequest):
                         check_out
                     )
                 except Exception:
-                    # Se manca il prezzo, non conviene proporre la camera in chiamata.
                     continue
 
                 disponibili.append({
@@ -418,7 +420,6 @@ def check_availability(req: AvailabilityRequest):
                     "url_camera": url_camera
                 })
 
-    # 8. Controllo camere combinate, ad esempio Orsini disponibile solo se Arechi e Iside sono disponibili
     for _, camera in camere_combinate.iterrows():
         camera_key = str(camera["camera_key"]).strip()
         nome_camera = str(camera["nome_camera"]).strip()
@@ -429,6 +430,7 @@ def check_availability(req: AvailabilityRequest):
             continue
 
         dipendenze = ""
+
         if "camere_dipendenti" in camere.columns:
             dipendenze = str(camera.get("camere_dipendenti", "")).strip()
 
@@ -462,15 +464,17 @@ def check_availability(req: AvailabilityRequest):
             "url_camera": url_camera
         })
 
-    # 9. Risposta finale
     if not disponibili:
         return error_response(
             f"Mi dispiace, non risultano disponibilità dal {req.check_in} "
             f"al {req.check_out} per {req.guests} ospiti."
         )
 
-    # Esclude eventuali prezzi zero o negativi se presenti per errore.
-    disponibili_validi = [x for x in disponibili if x["total_price"] > 0]
+    disponibili_validi = [
+        camera for camera in disponibili
+        if camera["total_price"] > 0
+    ]
+
     if not disponibili_validi:
         return error_response(
             "Ho trovato disponibilità, ma non riesco a calcolare correttamente il prezzo. "
