@@ -308,6 +308,107 @@ def sumup_headers() -> dict:
     }
 
 
+def extract_checkout_id_from_webhook(payload: dict) -> str:
+    """
+    Prova a estrarre il checkout_id da diversi possibili formati webhook SumUp.
+    """
+    if not isinstance(payload, dict):
+        return ""
+
+    possible_keys = [
+        "id",
+        "checkout_id",
+        "resource_id",
+        "resourceId",
+        "transaction_id"
+    ]
+
+    for key in possible_keys:
+        value = payload.get(key)
+        if value:
+            return str(value)
+
+    resource = payload.get("resource")
+
+    if isinstance(resource, dict):
+        for key in possible_keys:
+            value = resource.get(key)
+            if value:
+                return str(value)
+
+    event = payload.get("event")
+
+    if isinstance(event, dict):
+        for key in possible_keys:
+            value = event.get(key)
+            if value:
+                return str(value)
+
+    return ""
+
+
+def send_payment_confirmed_internal_email(
+    checkout_id: str,
+    status: str,
+    sumup_data: dict
+) -> Tuple[bool, str]:
+    """
+    Invia una notifica interna quando SumUp segnala pagamento confermato.
+    Per ora non collega ancora camera/date perché serve una tabella PRENOTAZIONI_AI.
+    """
+    if not RESEND_API_KEY:
+        return False, "RESEND_API_KEY non configurata."
+
+    checkout_reference = sumup_data.get("checkout_reference", "")
+    amount = sumup_data.get("amount", "")
+    currency = sumup_data.get("currency", "")
+    description = sumup_data.get("description", "")
+    payment_type = sumup_data.get("payment_type", "")
+    transaction_id = sumup_data.get("transaction_id", "")
+
+    html = f"""
+    <h2>Pagamento SumUp confermato</h2>
+
+    <p>
+    SumUp ha notificato un pagamento con stato <b>{status}</b>.
+    </p>
+
+    <hr>
+
+    <p><b>Checkout ID:</b> {checkout_id}</p>
+    <p><b>Checkout reference:</b> {checkout_reference}</p>
+    <p><b>Importo:</b> {amount} {currency}</p>
+    <p><b>Descrizione:</b> {description}</p>
+    <p><b>Payment type:</b> {payment_type}</p>
+    <p><b>Transaction ID:</b> {transaction_id}</p>
+
+    <hr>
+
+    <p>
+    Controlla SumUp e, se tutto è corretto, procedi con il blocco/prenotazione della camera.
+    </p>
+
+    <p>
+    Nota: per bloccare automaticamente Google Calendar/Airbnb/Beddy serve collegare questo checkout
+    a una riga prenotazione salvata, ad esempio nella scheda Google Sheet PRENOTAZIONI_AI.
+    </p>
+    """
+
+    try:
+        response = resend.Emails.send({
+            "from": RESEND_FROM,
+            "to": [INTERNAL_NOTIFICATION_EMAIL],
+            "subject": f"Pagamento SumUp confermato - {checkout_reference or checkout_id}",
+            "html": html
+        })
+
+        print(response)
+        return True, ""
+
+    except Exception as e:
+        return False, str(e)
+
+
 def create_sumup_checkout_link(req: SumupCheckoutRequest) -> dict:
     if not SUMUP_API_KEY:
         return {
@@ -685,6 +786,85 @@ def sumup_checkout_status(req: SumupCheckoutStatusRequest):
             "success": False,
             "message": f"Errore controllo stato SumUp: {str(e)}",
             "status": ""
+        }
+
+
+@app.post("/sumup-webhook")
+def sumup_webhook(payload: dict):
+    """
+    Endpoint chiamato da SumUp quando cambia lo stato di un checkout/pagamento.
+    URL da configurare in SumUp:
+    https://assistente-telefonico.onrender.com/sumup-webhook
+    """
+    print("Webhook SumUp ricevuto:", payload)
+
+    checkout_id = extract_checkout_id_from_webhook(payload)
+
+    if not checkout_id:
+        return {
+            "success": False,
+            "message": "checkout_id non trovato nel webhook SumUp",
+            "payload": payload
+        }
+
+    if not SUMUP_API_KEY:
+        return {
+            "success": False,
+            "message": "SUMUP_API_KEY non configurata.",
+            "checkout_id": checkout_id
+        }
+
+    try:
+        response = http.get(
+            f"{SUMUP_API_BASE_URL}/v0.1/checkouts/{checkout_id}",
+            headers=sumup_headers(),
+            timeout=REQUEST_TIMEOUT_SECONDS
+        )
+
+        try:
+            data = response.json()
+        except Exception:
+            data = {
+                "raw_response": response.text
+            }
+
+        if response.status_code not in [200, 201]:
+            return {
+                "success": False,
+                "message": f"Errore controllo checkout SumUp: HTTP {response.status_code}",
+                "checkout_id": checkout_id,
+                "sumup_response": data
+            }
+
+        status = str(data.get("status", "")).upper()
+
+        internal_email_sent = False
+        internal_email_error = ""
+
+        if status == "PAID":
+            print("Pagamento SumUp confermato:", data)
+
+            internal_email_sent, internal_email_error = send_payment_confirmed_internal_email(
+                checkout_id=checkout_id,
+                status=status,
+                sumup_data=data
+            )
+
+        return {
+            "success": True,
+            "message": "Webhook SumUp ricevuto correttamente.",
+            "checkout_id": checkout_id,
+            "status": status,
+            "internal_email_sent": internal_email_sent,
+            "internal_email_error": internal_email_error,
+            "sumup_response": data
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Errore gestione webhook SumUp: {str(e)}",
+            "checkout_id": checkout_id
         }
 
 
