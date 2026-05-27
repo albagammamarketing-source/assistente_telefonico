@@ -700,50 +700,62 @@ def send_booking_email(req: BookingEmailRequest):
         </p>
         """
 
-    payment_html = ""
+    sumup_html = ""
 
     if req.payment_link:
-        payment_html = f"""
-        <h3>Pagamento online</h3>
+        sumup_html = f"""
+        <h3>Opzione 1 - Pagamento online con SumUp</h3>
 
         <p>
-        Per confermare la prenotazione può procedere al pagamento dal seguente link sicuro SumUp:
+        Può confermare la prenotazione pagando online tramite il seguente link sicuro SumUp:
         </p>
 
         <p>
-            <a href="{req.payment_link}" 
+            <a href="{req.payment_link}"
                style="background-color:#111;color:#fff;padding:12px 18px;text-decoration:none;border-radius:6px;display:inline-block;">
                Paga ora con SumUp
             </a>
         </p>
 
         <p>
-        Link pagamento:<br>
+        Se il pulsante non funziona, può copiare e aprire questo link:<br>
         <a href="{req.payment_link}">{req.payment_link}</a>
-        </p>
-
-        <p>
-        La prenotazione sarà confermata solo dopo la ricezione del pagamento.
         </p>
         """
     else:
-        payment_html = f"""
-        <h3>Istruzioni pagamento</h3>
+        sumup_html = """
+        <h3>Opzione 1 - Pagamento online con SumUp</h3>
 
         <p>
-        Per confermare la prenotazione è necessario effettuare il pagamento tramite bonifico bancario.
-        </p>
-
-        <p>
-        <b>Intestatario:</b> Gabriella Aucone<br>
-        <b>IBAN:</b> IT20X0760115000001056847310<br>
-        <b>Causale:</b> Soggiorno {req.nome}
-        </p>
-
-        <p>
-        Dopo il pagamento riceverà conferma definitiva della prenotazione.
+        Il link SumUp non è disponibile in questa email. Può comunque confermare la prenotazione tramite bonifico bancario.
         </p>
         """
+
+    payment_html = f"""
+    <h3>Modalità di pagamento</h3>
+
+    <p>
+    Per confermare la prenotazione può scegliere una delle seguenti modalità di pagamento.
+    </p>
+
+    {sumup_html}
+
+    <h3>Opzione 2 - Bonifico bancario</h3>
+
+    <p>
+    Può confermare la prenotazione anche tramite bonifico bancario utilizzando i seguenti dati:
+    </p>
+
+    <p>
+    <b>Intestatario:</b> Gabriella Aucone<br>
+    <b>IBAN:</b> IT20X0760115000001056847310<br>
+    <b>Causale:</b> Soggiorno {req.nome}
+    </p>
+
+    <p>
+    La prenotazione sarà confermata solo dopo la ricezione del pagamento.
+    </p>
+    """
 
     html = f"""
     <h2>Riepilogo richiesta prenotazione Janara</h2>
