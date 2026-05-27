@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 import resend
 from fastapi import FastAPI
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from icalendar import Calendar
 
 
@@ -73,7 +73,7 @@ class AvailabilityRequest(BaseModel):
 
 class BookingEmailRequest(BaseModel):
     nome: str
-    email: EmailStr
+    email: str
     telefono: str
     struttura: str
     camera: str
@@ -87,7 +87,7 @@ class BookingEmailRequest(BaseModel):
 
 class SumupCheckoutRequest(BaseModel):
     nome: str
-    email: Optional[EmailStr] = None
+    email: Optional[str] = None
     telefono: Optional[str] = ""
     struttura: str
     camera: str
