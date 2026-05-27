@@ -13,6 +13,9 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from icalendar import Calendar
 
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
 
 app = FastAPI(title="Janara Reception API")
 
@@ -40,6 +43,8 @@ SPREADSHEET_ID = os.environ.get(
 GID_CAMERE_CONFIG = os.environ.get("GID_CAMERE_CONFIG", "0")
 GID_PREZZI = os.environ.get("GID_PREZZI", "415348027")
 
+PRENOTAZIONI_SHEET_NAME = os.environ.get("PRENOTAZIONI_SHEET_NAME", "PRENOTAZIONI_AI")
+
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "8"))
 
 SHEET_CACHE_SECONDS = int(os.environ.get("SHEET_CACHE_SECONDS", "300"))
@@ -61,11 +66,25 @@ SUMUP_API_BASE_URL = os.environ.get(
     "https://api.sumup.com"
 )
 
+# Google API
+GOOGLE_APPLICATION_CREDENTIALS = os.environ.get(
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "/etc/secrets/google_calendar_credentials.json"
+)
+
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/spreadsheets"
+]
+
 
 http = requests.Session()
 
 _sheet_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
 _ical_cache: Dict[str, Tuple[float, List[Tuple[date, date]]]] = {}
+
+_google_sheets_service = None
+_google_calendar_service = None
 
 
 # =========================
@@ -99,6 +118,7 @@ class SumupCheckoutRequest(BaseModel):
     telefono: Optional[str] = ""
     struttura: str
     camera: str
+    camera_key: Optional[str] = ""
     check_in: str
     check_out: str
     ospiti: int
@@ -107,6 +127,185 @@ class SumupCheckoutRequest(BaseModel):
 
 class SumupCheckoutStatusRequest(BaseModel):
     checkout_id: str
+
+
+# =========================
+# FUNZIONI GOOGLE API
+# =========================
+
+def get_google_credentials():
+    if not os.path.exists(GOOGLE_APPLICATION_CREDENTIALS):
+        raise FileNotFoundError(
+            f"File credenziali Google non trovato: {GOOGLE_APPLICATION_CREDENTIALS}"
+        )
+
+    return service_account.Credentials.from_service_account_file(
+        GOOGLE_APPLICATION_CREDENTIALS,
+        scopes=GOOGLE_SCOPES
+    )
+
+
+def get_sheets_service():
+    global _google_sheets_service
+
+    if _google_sheets_service is None:
+        credentials = get_google_credentials()
+        _google_sheets_service = build("sheets", "v4", credentials=credentials)
+
+    return _google_sheets_service
+
+
+def get_calendar_service():
+    global _google_calendar_service
+
+    if _google_calendar_service is None:
+        credentials = get_google_credentials()
+        _google_calendar_service = build("calendar", "v3", credentials=credentials)
+
+    return _google_calendar_service
+
+
+def col_to_letter(col_index: int) -> str:
+    result = ""
+
+    while col_index > 0:
+        col_index, remainder = divmod(col_index - 1, 26)
+        result = chr(65 + remainder) + result
+
+    return result
+
+
+def get_prenotazioni_values() -> List[List[str]]:
+    service = get_sheets_service()
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{PRENOTAZIONI_SHEET_NAME}!A1:R"
+    ).execute()
+
+    return result.get("values", [])
+
+
+def append_prenotazione_ai(row: List):
+    service = get_sheets_service()
+
+    service.spreadsheets().values().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{PRENOTAZIONI_SHEET_NAME}!A:R",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={
+            "values": [row]
+        }
+    ).execute()
+
+
+def find_prenotazione_by_checkout_id(checkout_id: str) -> Tuple[Optional[int], Optional[dict], List[str]]:
+    values = get_prenotazioni_values()
+
+    if not values:
+        return None, None, []
+
+    headers = [str(h).strip() for h in values[0]]
+
+    for index, row in enumerate(values[1:], start=2):
+        row_dict = {}
+
+        for col_index, header in enumerate(headers):
+            row_dict[header] = row[col_index] if col_index < len(row) else ""
+
+        if str(row_dict.get("checkout_id", "")).strip() == str(checkout_id).strip():
+            return index, row_dict, headers
+
+    return None, None, headers
+
+
+def update_prenotazione_fields(row_index: int, headers: List[str], updates: Dict[str, str]):
+    service = get_sheets_service()
+
+    data = []
+
+    for field, value in updates.items():
+        if field not in headers:
+            continue
+
+        col_index = headers.index(field) + 1
+        col_letter = col_to_letter(col_index)
+
+        data.append({
+            "range": f"{PRENOTAZIONI_SHEET_NAME}!{col_letter}{row_index}",
+            "values": [[value]]
+        })
+
+    if not data:
+        return
+
+    service.spreadsheets().values().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body={
+            "valueInputOption": "RAW",
+            "data": data
+        }
+    ).execute()
+
+
+def create_google_calendar_event_from_booking(booking: dict) -> dict:
+    calendar_id = str(booking.get("google_calendar_id", "")).strip()
+
+    if not calendar_id:
+        raise ValueError("google_calendar_id mancante nella prenotazione.")
+
+    check_in = str(booking.get("check_in", "")).strip()
+    check_out = str(booking.get("check_out", "")).strip()
+    nome = str(booking.get("nome", "")).strip()
+    email = str(booking.get("email", "")).strip()
+    telefono = str(booking.get("telefono", "")).strip()
+    camera = str(booking.get("camera", "")).strip()
+    struttura = str(booking.get("struttura", "")).strip()
+    ospiti = str(booking.get("ospiti", "")).strip()
+    totale = str(booking.get("totale", "")).strip()
+    checkout_reference = str(booking.get("checkout_reference", "")).strip()
+    checkout_id = str(booking.get("checkout_id", "")).strip()
+
+    summary = f"Prenotazione Janara - {camera} - {nome}"
+
+    description = f"""
+Prenotazione confermata da pagamento SumUp.
+
+Cliente: {nome}
+Email: {email}
+Telefono: {telefono}
+
+Struttura: {struttura}
+Camera: {camera}
+Check-in: {check_in}
+Check-out: {check_out}
+Ospiti: {ospiti}
+Totale: € {totale}
+
+Checkout ID: {checkout_id}
+Checkout reference: {checkout_reference}
+""".strip()
+
+    event = {
+        "summary": summary,
+        "description": description,
+        "start": {
+            "date": check_in
+        },
+        "end": {
+            "date": check_out
+        }
+    }
+
+    service = get_calendar_service()
+
+    created_event = service.events().insert(
+        calendarId=calendar_id,
+        body=event
+    ).execute()
+
+    return created_event
 
 
 # =========================
@@ -288,6 +487,60 @@ def validate_camere_config(camere: pd.DataFrame) -> Optional[str]:
     return None
 
 
+def find_camera_config(camera_key: str = "", camera_name: str = "", struttura: str = "") -> dict:
+    camere = load_sheet(GID_CAMERE_CONFIG, use_cache=False)
+    camere.columns = [str(c).strip() for c in camere.columns]
+
+    if "google_calendar_id" not in camere.columns:
+        raise ValueError("Nel foglio CAMERE_CONFIG manca la colonna google_calendar_id.")
+
+    camera_key_norm = normalize(camera_key)
+    camera_name_norm = normalize(camera_name)
+    struttura_norm = normalize(struttura)
+
+    if camera_key_norm:
+        match = camere[
+            camere["camera_key"].astype(str).str.strip().str.lower() == camera_key_norm
+        ]
+
+        if not match.empty:
+            row = match.iloc[0].to_dict()
+            return {
+                "camera_key": str(row.get("camera_key", "")).strip(),
+                "nome_camera": str(row.get("nome_camera", "")).strip(),
+                "google_calendar_id": str(row.get("google_calendar_id", "")).strip()
+            }
+
+    match = camere[
+        camere["nome_camera"].astype(str).str.lower().str.contains(camera_name_norm, na=False, regex=False)
+        |
+        camere["camera_key"].astype(str).str.lower().str.contains(camera_name_norm, na=False, regex=False)
+    ]
+
+    if struttura_norm and not match.empty:
+        match2 = match[
+            match["nome_struttura"].astype(str).str.lower().str.contains(struttura_norm, na=False, regex=False)
+            |
+            match["struttura_key"].astype(str).str.lower().str.contains(struttura_norm, na=False, regex=False)
+            |
+            match["citta"].astype(str).str.lower().str.contains(struttura_norm, na=False, regex=False)
+        ]
+
+        if not match2.empty:
+            match = match2
+
+    if match.empty:
+        raise ValueError(f"Non riesco a trovare la camera nel CAMERE_CONFIG: {camera_name}")
+
+    row = match.iloc[0].to_dict()
+
+    return {
+        "camera_key": str(row.get("camera_key", "")).strip(),
+        "nome_camera": str(row.get("nome_camera", "")).strip(),
+        "google_calendar_id": str(row.get("google_calendar_id", "")).strip()
+    }
+
+
 def check_single_room_availability(
     row,
     check_in: date,
@@ -350,7 +603,10 @@ def extract_checkout_id_from_webhook(payload: dict) -> str:
 def send_payment_confirmed_internal_email(
     checkout_id: str,
     status: str,
-    sumup_data: dict
+    sumup_data: dict,
+    booking: Optional[dict] = None,
+    google_event_id: str = "",
+    google_event_link: str = ""
 ) -> Tuple[bool, str]:
     if not RESEND_API_KEY:
         return False, "RESEND_API_KEY non configurata."
@@ -362,6 +618,49 @@ def send_payment_confirmed_internal_email(
     payment_type = sumup_data.get("payment_type", "")
     transaction_id = sumup_data.get("transaction_id", "")
 
+    booking_html = ""
+
+    if booking:
+        booking_html = f"""
+        <hr>
+
+        <h3>Dati prenotazione</h3>
+
+        <p><b>Nome:</b> {booking.get("nome", "")}</p>
+        <p><b>Email:</b> {booking.get("email", "")}</p>
+        <p><b>Telefono:</b> {booking.get("telefono", "")}</p>
+        <p><b>Struttura:</b> {booking.get("struttura", "")}</p>
+        <p><b>Camera:</b> {booking.get("camera", "")}</p>
+        <p><b>Camera key:</b> {booking.get("camera_key", "")}</p>
+        <p><b>Check-in:</b> {booking.get("check_in", "")}</p>
+        <p><b>Check-out:</b> {booking.get("check_out", "")}</p>
+        <p><b>Ospiti:</b> {booking.get("ospiti", "")}</p>
+        <p><b>Totale:</b> € {booking.get("totale", "")}</p>
+        """
+
+    calendar_html = ""
+
+    if google_event_id:
+        calendar_html = f"""
+        <hr>
+
+        <h3>Google Calendar</h3>
+
+        <p><b>Evento creato:</b> Sì</p>
+        <p><b>Google event ID:</b> {google_event_id}</p>
+        <p><b>Link evento:</b><br>
+        <a href="{google_event_link}">{google_event_link}</a>
+        </p>
+        """
+    else:
+        calendar_html = """
+        <hr>
+
+        <h3>Google Calendar</h3>
+
+        <p><b>Evento creato:</b> No o non ancora disponibile</p>
+        """
+
     html = f"""
     <h2>Pagamento SumUp confermato</h2>
 
@@ -371,6 +670,8 @@ def send_payment_confirmed_internal_email(
 
     <hr>
 
+    <h3>Dati pagamento</h3>
+
     <p><b>Checkout ID:</b> {checkout_id}</p>
     <p><b>Checkout reference:</b> {checkout_reference}</p>
     <p><b>Importo:</b> {amount} {currency}</p>
@@ -378,15 +679,14 @@ def send_payment_confirmed_internal_email(
     <p><b>Payment type:</b> {payment_type}</p>
     <p><b>Transaction ID:</b> {transaction_id}</p>
 
+    {booking_html}
+
+    {calendar_html}
+
     <hr>
 
     <p>
-    Controlla SumUp e, se tutto è corretto, procedi con il blocco/prenotazione della camera.
-    </p>
-
-    <p>
-    Nota: per bloccare automaticamente Google Calendar/Airbnb/Beddy serve collegare questo checkout
-    a una riga prenotazione salvata, ad esempio nella scheda Google Sheet PRENOTAZIONI_AI.
+    Controlla che Airbnb/Beddy importino correttamente il calendario iCal della camera.
     </p>
     """
 
@@ -432,6 +732,19 @@ def create_sumup_checkout_link(req: SumupCheckoutRequest) -> dict:
             "checkout_id": "",
             "checkout_reference": ""
         }
+
+    try:
+        camera_config = find_camera_config(
+            camera_key=req.camera_key or "",
+            camera_name=req.camera,
+            struttura=req.struttura
+        )
+        resolved_camera_key = camera_config.get("camera_key", "")
+        google_calendar_id = camera_config.get("google_calendar_id", "")
+    except Exception as e:
+        resolved_camera_key = req.camera_key or ""
+        google_calendar_id = ""
+        print(f"Errore lettura configurazione camera: {str(e)}")
 
     checkout_reference = (
         f"JANARA-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-"
@@ -483,15 +796,128 @@ def create_sumup_checkout_link(req: SumupCheckoutRequest) -> dict:
         }
 
     payment_link = data.get("hosted_checkout_url", "")
+    checkout_id = data.get("id", "")
+    now_iso = datetime.utcnow().isoformat()
+
+    prenotazione_row = [
+        checkout_id,
+        checkout_reference,
+        req.nome,
+        req.email or "",
+        req.telefono or "",
+        req.struttura,
+        req.camera,
+        resolved_camera_key,
+        req.check_in,
+        req.check_out,
+        req.ospiti,
+        req.totale,
+        payment_link,
+        "PENDING",
+        google_calendar_id,
+        "",
+        now_iso,
+        ""
+    ]
+
+    saved_to_sheet = False
+    save_error = ""
+
+    try:
+        append_prenotazione_ai(prenotazione_row)
+        saved_to_sheet = True
+    except Exception as e:
+        save_error = str(e)
+        print(f"Errore salvataggio PRENOTAZIONI_AI: {save_error}")
 
     return {
         "success": True,
         "message": "Link pagamento SumUp creato correttamente.",
         "payment_link": payment_link,
-        "checkout_id": data.get("id", ""),
+        "checkout_id": checkout_id,
         "checkout_reference": checkout_reference,
+        "camera_key": resolved_camera_key,
+        "google_calendar_id": google_calendar_id,
+        "saved_to_prenotazioni_ai": saved_to_sheet,
+        "save_error": save_error,
         "status": data.get("status", ""),
         "sumup_response": data
+    }
+
+
+def handle_paid_checkout(checkout_id: str, sumup_data: dict) -> dict:
+    row_index, booking, headers = find_prenotazione_by_checkout_id(checkout_id)
+
+    google_event_id = ""
+    google_event_link = ""
+    calendar_created = False
+    calendar_error = ""
+
+    if not booking:
+        email_sent, email_error = send_payment_confirmed_internal_email(
+            checkout_id=checkout_id,
+            status="PAID",
+            sumup_data=sumup_data,
+            booking=None
+        )
+
+        return {
+            "booking_found": False,
+            "calendar_created": False,
+            "calendar_error": "Prenotazione non trovata in PRENOTAZIONI_AI.",
+            "internal_email_sent": email_sent,
+            "internal_email_error": email_error
+        }
+
+    existing_event_id = str(booking.get("google_event_id", "")).strip()
+
+    if existing_event_id:
+        google_event_id = existing_event_id
+        calendar_created = False
+        calendar_error = "Evento già presente, non duplicato."
+    else:
+        try:
+            created_event = create_google_calendar_event_from_booking(booking)
+            google_event_id = created_event.get("id", "")
+            google_event_link = created_event.get("htmlLink", "")
+            calendar_created = True
+        except Exception as e:
+            calendar_error = str(e)
+            print(f"Errore creazione evento Google Calendar: {calendar_error}")
+
+    updates = {
+        "stato_pagamento": "PAID",
+        "data_pagamento": datetime.utcnow().isoformat()
+    }
+
+    if google_event_id:
+        updates["google_event_id"] = google_event_id
+
+    try:
+        update_prenotazione_fields(row_index, headers, updates)
+    except Exception as e:
+        print(f"Errore aggiornamento PRENOTAZIONI_AI: {str(e)}")
+
+    if google_event_id:
+        booking["google_event_id"] = google_event_id
+
+    email_sent, email_error = send_payment_confirmed_internal_email(
+        checkout_id=checkout_id,
+        status="PAID",
+        sumup_data=sumup_data,
+        booking=booking,
+        google_event_id=google_event_id,
+        google_event_link=google_event_link
+    )
+
+    return {
+        "booking_found": True,
+        "calendar_created": calendar_created,
+        "google_event_id": google_event_id,
+        "google_event_link": google_event_link,
+        "calendar_error": calendar_error,
+        "internal_email_sent": email_sent,
+        "internal_email_error": email_error
     }
 
 
@@ -516,7 +942,9 @@ def health():
         "sumup_configured": bool(SUMUP_API_KEY and SUMUP_MERCHANT_CODE),
         "sumup_currency": SUMUP_CURRENCY,
         "sumup_redirect_url": SUMUP_REDIRECT_URL,
-        "internal_notification_email": INTERNAL_NOTIFICATION_EMAIL
+        "google_credentials_path": GOOGLE_APPLICATION_CREDENTIALS,
+        "internal_notification_email": INTERNAL_NOTIFICATION_EMAIL,
+        "prenotazioni_sheet_name": PRENOTAZIONI_SHEET_NAME
     }
 
 
@@ -774,11 +1202,21 @@ def sumup_checkout_status(req: SumupCheckoutStatusRequest):
                 "status": ""
             }
 
+        status = str(data.get("status", "")).upper()
+        paid_result = {}
+
+        if status == "PAID":
+            paid_result = handle_paid_checkout(
+                checkout_id=req.checkout_id,
+                sumup_data=data
+            )
+
         return {
             "success": True,
             "message": "Stato checkout recuperato correttamente.",
             "checkout_id": data.get("id", ""),
-            "status": data.get("status", ""),
+            "status": status,
+            "paid_result": paid_result,
             "sumup_response": data
         }
 
@@ -833,16 +1271,11 @@ def sumup_webhook_post(payload: dict):
             }
 
         status = str(data.get("status", "")).upper()
-
-        internal_email_sent = False
-        internal_email_error = ""
+        paid_result = {}
 
         if status == "PAID":
-            print("Pagamento SumUp confermato:", data)
-
-            internal_email_sent, internal_email_error = send_payment_confirmed_internal_email(
+            paid_result = handle_paid_checkout(
                 checkout_id=checkout_id,
-                status=status,
                 sumup_data=data
             )
 
@@ -851,8 +1284,7 @@ def sumup_webhook_post(payload: dict):
             "message": "Webhook SumUp POST ricevuto correttamente.",
             "checkout_id": checkout_id,
             "status": status,
-            "internal_email_sent": internal_email_sent,
-            "internal_email_error": internal_email_error,
+            "paid_result": paid_result,
             "sumup_response": data
         }
 
@@ -866,10 +1298,6 @@ def sumup_webhook_post(payload: dict):
 
 @app.get("/sumup-webhook")
 def sumup_webhook_get(checkout_id: Optional[str] = None, id: Optional[str] = None):
-    """
-    Gestisce anche il ritorno browser/redirect di SumUp dopo pagamento.
-    Se SumUp torna con ?checkout_id=... oppure ?id=..., controlla lo stato.
-    """
     resolved_checkout_id = checkout_id or id
 
     if not resolved_checkout_id:
@@ -901,14 +1329,11 @@ def sumup_webhook_get(checkout_id: Optional[str] = None, id: Optional[str] = Non
             }
 
         status = str(data.get("status", "")).upper()
-
-        internal_email_sent = False
-        internal_email_error = ""
+        paid_result = {}
 
         if response.status_code in [200, 201] and status == "PAID":
-            internal_email_sent, internal_email_error = send_payment_confirmed_internal_email(
+            paid_result = handle_paid_checkout(
                 checkout_id=resolved_checkout_id,
-                status=status,
                 sumup_data=data
             )
 
@@ -917,8 +1342,7 @@ def sumup_webhook_get(checkout_id: Optional[str] = None, id: Optional[str] = Non
             "message": "Ritorno SumUp ricevuto.",
             "checkout_id": resolved_checkout_id,
             "status": status,
-            "internal_email_sent": internal_email_sent,
-            "internal_email_error": internal_email_error,
+            "paid_result": paid_result,
             "sumup_response": data
         }
 
