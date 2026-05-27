@@ -27,6 +27,11 @@ if RESEND_API_KEY:
 
 RESEND_FROM = os.environ.get("RESEND_FROM", "Janara <info@janara.net>")
 
+INTERNAL_NOTIFICATION_EMAIL = os.environ.get(
+    "INTERNAL_NOTIFICATION_EMAIL",
+    "dario.guarriello@gmail.com"
+)
+
 SPREADSHEET_ID = os.environ.get(
     "SPREADSHEET_ID",
     "1orw2D-Rxh2omVj_MOBIdIsiLf90UjsvSZrpQqKYeTys"
@@ -408,7 +413,8 @@ def health():
         "service": "Janara Reception API",
         "resend_configured": bool(RESEND_API_KEY),
         "sumup_configured": bool(SUMUP_API_KEY and SUMUP_MERCHANT_CODE),
-        "sumup_currency": SUMUP_CURRENCY
+        "sumup_currency": SUMUP_CURRENCY,
+        "internal_notification_email": INTERNAL_NOTIFICATION_EMAIL
     }
 
 
@@ -700,8 +706,6 @@ def send_booking_email(req: BookingEmailRequest):
         </p>
         """
 
-    sumup_html = ""
-
     if req.payment_link:
         sumup_html = f"""
         <h3>Opzione 1 - Pagamento online con SumUp</h3>
@@ -757,7 +761,7 @@ def send_booking_email(req: BookingEmailRequest):
     </p>
     """
 
-    html = f"""
+    customer_html = f"""
     <h2>Riepilogo richiesta prenotazione Janara</h2>
 
     <p>Gentile {req.nome},</p>
@@ -793,25 +797,116 @@ def send_booking_email(req: BookingEmailRequest):
     </p>
     """
 
+    internal_payment_html = ""
+
+    if req.payment_link:
+        internal_payment_html = f"""
+        <p><b>Link pagamento SumUp:</b><br>
+        <a href="{req.payment_link}">{req.payment_link}</a>
+        </p>
+        """
+    else:
+        internal_payment_html = """
+        <p><b>Link pagamento SumUp:</b> non disponibile</p>
+        """
+
+    internal_url_camera_html = ""
+
+    if req.url_camera:
+        internal_url_camera_html = f"""
+        <p><b>Link camera / foto:</b><br>
+        <a href="{req.url_camera}">{req.url_camera}</a>
+        </p>
+        """
+    else:
+        internal_url_camera_html = """
+        <p><b>Link camera / foto:</b> non disponibile</p>
+        """
+
+    internal_html = f"""
+    <h2>Nuova richiesta prenotazione Janara</h2>
+
+    <p>
+    È stata inviata una nuova email di riepilogo al cliente.
+    </p>
+
+    <hr>
+
+    <h3>Dati cliente</h3>
+
+    <p><b>Nome cliente:</b> {req.nome}</p>
+    <p><b>Email cliente:</b> {req.email}</p>
+    <p><b>Telefono:</b> {req.telefono}</p>
+
+    <hr>
+
+    <h3>Dati soggiorno</h3>
+
+    <p><b>Struttura:</b> {req.struttura}</p>
+    <p><b>Camera:</b> {req.camera}</p>
+    <p><b>Check-in:</b> {req.check_in}</p>
+    <p><b>Check-out:</b> {req.check_out}</p>
+    <p><b>Ospiti:</b> {req.ospiti}</p>
+    <p><b>Totale soggiorno:</b> € {req.totale}</p>
+
+    <hr>
+
+    <h3>Link utili</h3>
+
+    {internal_url_camera_html}
+    {internal_payment_html}
+
+    <hr>
+
+    <p>
+    Questa è una notifica interna automatica generata dal centralino Janara.
+    </p>
+    """
+
+    internal_email_sent = False
+    internal_email_error = ""
+
     try:
-        email_response = resend.Emails.send({
+        customer_response = resend.Emails.send({
             "from": RESEND_FROM,
             "to": [str(req.email)],
             "subject": "Riepilogo prenotazione Janara",
-            "html": html
+            "html": customer_html
         })
 
-        print(email_response)
+        print(customer_response)
+
+        try:
+            internal_response = resend.Emails.send({
+                "from": RESEND_FROM,
+                "to": [INTERNAL_NOTIFICATION_EMAIL],
+                "subject": f"Nuova richiesta Janara - {req.nome}",
+                "html": internal_html
+            })
+
+            print(internal_response)
+            internal_email_sent = True
+
+        except Exception as internal_error:
+            internal_email_error = str(internal_error)
+            print(f"Errore invio email interna: {internal_email_error}")
 
         return {
             "success": True,
-            "message": f"Email inviata a {req.email}"
+            "message": f"Email inviata a {req.email}",
+            "customer_email": str(req.email),
+            "internal_email_sent": internal_email_sent,
+            "internal_email": INTERNAL_NOTIFICATION_EMAIL,
+            "internal_email_error": internal_email_error
         }
 
     except Exception as e:
         return {
             "success": False,
-            "message": f"Errore invio email: {str(e)}"
+            "message": f"Errore invio email cliente: {str(e)}",
+            "internal_email_sent": internal_email_sent,
+            "internal_email": INTERNAL_NOTIFICATION_EMAIL,
+            "internal_email_error": internal_email_error
         }
 
 
