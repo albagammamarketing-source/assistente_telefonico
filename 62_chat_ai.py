@@ -51,7 +51,10 @@ MAX_ICAL_WORKERS = int(os.environ.get("MAX_ICAL_WORKERS", "6"))
 SUMUP_API_KEY = os.environ.get("SUMUP_API_KEY", "")
 SUMUP_MERCHANT_CODE = os.environ.get("SUMUP_MERCHANT_CODE", "")
 SUMUP_CURRENCY = os.environ.get("SUMUP_CURRENCY", "EUR")
-SUMUP_REDIRECT_URL = os.environ.get("SUMUP_REDIRECT_URL", "")
+SUMUP_REDIRECT_URL = os.environ.get(
+    "SUMUP_REDIRECT_URL",
+    "https://assistente-telefonico.onrender.com/sumup-webhook"
+)
 
 SUMUP_API_BASE_URL = os.environ.get(
     "SUMUP_API_BASE_URL",
@@ -309,9 +312,6 @@ def sumup_headers() -> dict:
 
 
 def extract_checkout_id_from_webhook(payload: dict) -> str:
-    """
-    Prova a estrarre il checkout_id da diversi possibili formati webhook SumUp.
-    """
     if not isinstance(payload, dict):
         return ""
 
@@ -352,10 +352,6 @@ def send_payment_confirmed_internal_email(
     status: str,
     sumup_data: dict
 ) -> Tuple[bool, str]:
-    """
-    Invia una notifica interna quando SumUp segnala pagamento confermato.
-    Per ora non collega ancora camera/date perché serve una tabella PRENOTAZIONI_AI.
-    """
     if not RESEND_API_KEY:
         return False, "RESEND_API_KEY non configurata."
 
@@ -437,7 +433,10 @@ def create_sumup_checkout_link(req: SumupCheckoutRequest) -> dict:
             "checkout_reference": ""
         }
 
-    checkout_reference = f"JANARA-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    checkout_reference = (
+        f"JANARA-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-"
+        f"{uuid.uuid4().hex[:8]}"
+    )
 
     description = (
         f"Prenotazione Janara - {req.camera} - "
@@ -456,6 +455,7 @@ def create_sumup_checkout_link(req: SumupCheckoutRequest) -> dict:
     }
 
     if SUMUP_REDIRECT_URL:
+        payload["return_url"] = SUMUP_REDIRECT_URL
         payload["redirect_url"] = SUMUP_REDIRECT_URL
 
     response = http.post(
@@ -515,6 +515,7 @@ def health():
         "resend_configured": bool(RESEND_API_KEY),
         "sumup_configured": bool(SUMUP_API_KEY and SUMUP_MERCHANT_CODE),
         "sumup_currency": SUMUP_CURRENCY,
+        "sumup_redirect_url": SUMUP_REDIRECT_URL,
         "internal_notification_email": INTERNAL_NOTIFICATION_EMAIL
     }
 
@@ -790,13 +791,8 @@ def sumup_checkout_status(req: SumupCheckoutStatusRequest):
 
 
 @app.post("/sumup-webhook")
-def sumup_webhook(payload: dict):
-    """
-    Endpoint chiamato da SumUp quando cambia lo stato di un checkout/pagamento.
-    URL da configurare in SumUp:
-    https://assistente-telefonico.onrender.com/sumup-webhook
-    """
-    print("Webhook SumUp ricevuto:", payload)
+def sumup_webhook_post(payload: dict):
+    print("Webhook SumUp POST ricevuto:", payload)
 
     checkout_id = extract_checkout_id_from_webhook(payload)
 
@@ -852,7 +848,7 @@ def sumup_webhook(payload: dict):
 
         return {
             "success": True,
-            "message": "Webhook SumUp ricevuto correttamente.",
+            "message": "Webhook SumUp POST ricevuto correttamente.",
             "checkout_id": checkout_id,
             "status": status,
             "internal_email_sent": internal_email_sent,
@@ -865,6 +861,72 @@ def sumup_webhook(payload: dict):
             "success": False,
             "message": f"Errore gestione webhook SumUp: {str(e)}",
             "checkout_id": checkout_id
+        }
+
+
+@app.get("/sumup-webhook")
+def sumup_webhook_get(checkout_id: Optional[str] = None, id: Optional[str] = None):
+    """
+    Gestisce anche il ritorno browser/redirect di SumUp dopo pagamento.
+    Se SumUp torna con ?checkout_id=... oppure ?id=..., controlla lo stato.
+    """
+    resolved_checkout_id = checkout_id or id
+
+    if not resolved_checkout_id:
+        return {
+            "success": True,
+            "message": "Ritorno SumUp ricevuto, ma nessun checkout_id presente nei parametri.",
+            "hint": "Il pagamento va verificato dal pannello SumUp o tramite /sumup-checkout-status."
+        }
+
+    if not SUMUP_API_KEY:
+        return {
+            "success": False,
+            "message": "SUMUP_API_KEY non configurata.",
+            "checkout_id": resolved_checkout_id
+        }
+
+    try:
+        response = http.get(
+            f"{SUMUP_API_BASE_URL}/v0.1/checkouts/{resolved_checkout_id}",
+            headers=sumup_headers(),
+            timeout=REQUEST_TIMEOUT_SECONDS
+        )
+
+        try:
+            data = response.json()
+        except Exception:
+            data = {
+                "raw_response": response.text
+            }
+
+        status = str(data.get("status", "")).upper()
+
+        internal_email_sent = False
+        internal_email_error = ""
+
+        if response.status_code in [200, 201] and status == "PAID":
+            internal_email_sent, internal_email_error = send_payment_confirmed_internal_email(
+                checkout_id=resolved_checkout_id,
+                status=status,
+                sumup_data=data
+            )
+
+        return {
+            "success": response.status_code in [200, 201],
+            "message": "Ritorno SumUp ricevuto.",
+            "checkout_id": resolved_checkout_id,
+            "status": status,
+            "internal_email_sent": internal_email_sent,
+            "internal_email_error": internal_email_error,
+            "sumup_response": data
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Errore gestione ritorno SumUp: {str(e)}",
+            "checkout_id": resolved_checkout_id
         }
 
 
