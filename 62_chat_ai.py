@@ -2,6 +2,9 @@ import io
 import os
 import time
 import uuid
+import re
+from xml.sax.saxutils import escape
+from urllib.parse import parse_qs
 from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
@@ -9,7 +12,7 @@ from typing import Dict, List, Tuple, Optional
 import pandas as pd
 import requests
 import resend
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel
 from icalendar import Calendar
 
@@ -1574,6 +1577,113 @@ def send_booking_email(req: BookingEmailRequest):
             "internal_email": INTERNAL_NOTIFICATION_EMAIL,
             "internal_email_error": internal_email_error
         }
+
+
+# =========================
+# ENDPOINT WHATSAPP / TWILIO
+# =========================
+
+@app.get("/whatsapp-webhook")
+def whatsapp_webhook_test():
+    return {
+        "status": "ok",
+        "message": "Webhook WhatsApp attivo. In Twilio usa questo endpoint con metodo POST.",
+        "endpoint": "/whatsapp-webhook"
+    }
+
+
+@app.post("/whatsapp-webhook")
+async def whatsapp_webhook(request: Request):
+    """
+    Webhook per messaggi WhatsApp ricevuti da Twilio.
+
+    Twilio invia normalmente i dati come application/x-www-form-urlencoded:
+    - Body: testo del messaggio ricevuto
+    - From: numero WhatsApp del cliente
+
+    La risposta viene restituita in formato TwiML XML.
+    """
+
+    raw_body = await request.body()
+    parsed_body = parse_qs(raw_body.decode("utf-8", errors="ignore"))
+
+    incoming_message = str(parsed_body.get("Body", [""])[0]).strip()
+    from_number = str(parsed_body.get("From", [""])[0]).strip()
+
+    print(f"Messaggio WhatsApp ricevuto da {from_number}: {incoming_message}")
+
+    text = incoming_message.lower().strip()
+
+    reply = (
+        "Ciao, sono l'assistente WhatsApp di Janara. "
+        "Posso aiutarti a controllare disponibilità e prezzi.\n\n"
+        "Per fare una prova scrivi così:\n"
+        "disponibilità Benevento 2026-06-20 2026-06-22 2\n\n"
+        "Formato:\n"
+        "disponibilità città check-in check-out ospiti"
+    )
+
+    # Esempio accettato:
+    # disponibilità Benevento 2026-06-20 2026-06-22 2
+    pattern = (
+        r"(?:disponibilita|disponibilità)\s+"
+        r"(.+?)\s+"
+        r"(\d{4}-\d{2}-\d{2})\s+"
+        r"(\d{4}-\d{2}-\d{2})\s+"
+        r"(\d+)"
+    )
+
+    match = re.search(pattern, text)
+
+    if match:
+        struttura = match.group(1).strip()
+        check_in = match.group(2).strip()
+        check_out = match.group(3).strip()
+        ospiti = int(match.group(4).strip())
+
+        try:
+            result = check_availability(
+                AvailabilityRequest(
+                    structure=struttura,
+                    check_in=check_in,
+                    check_out=check_out,
+                    guests=ospiti
+                )
+            )
+
+            reply = result.get(
+                "message",
+                "Non sono riuscito a controllare la disponibilità."
+            )
+
+            if result.get("available"):
+                url_camera = str(result.get("url_camera", "")).strip()
+
+                if url_camera:
+                    reply += f"\n\nPuoi vedere la camera qui:\n{url_camera}"
+
+                reply += (
+                    "\n\nVuoi ricevere il riepilogo della prenotazione via email? "
+                    "Rispondi indicando nome, email e telefono."
+                )
+
+        except Exception as e:
+            reply = (
+                "Mi dispiace, ho avuto un problema nel controllo disponibilità. "
+                f"Errore: {str(e)}"
+            )
+
+    # Risposta Twilio in formato TwiML
+    escaped_reply = escape(reply)
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Response>\n'
+        f'    <Message>{escaped_reply}</Message>\n'
+        '</Response>'
+    )
+
+    return Response(content=twiml, media_type="application/xml")
+
 
 
 if __name__ == "__main__":
