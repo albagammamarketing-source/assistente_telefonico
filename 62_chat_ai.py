@@ -19,6 +19,11 @@ from icalendar import Calendar
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
 
 app = FastAPI(title="Janara Reception API")
 
@@ -79,6 +84,22 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/spreadsheets"
 ]
+
+# OpenAI opzionale. Il webhook WhatsApp funziona anche senza OpenAI,
+# usando una logica conversazionale guidata e sicura.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+_openai_client = None
+if OPENAI_API_KEY and OpenAI is not None:
+    try:
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        print(f"OpenAI non inizializzato: {str(e)}")
+
+# Memoria conversazionale semplice per numero WhatsApp.
+# Nota: su Render questa memoria è volatile e si resetta a ogni deploy/riavvio.
+WHATSAPP_SESSIONS: Dict[str, dict] = {}
 
 
 http = requests.Session()
@@ -1579,6 +1600,524 @@ def send_booking_email(req: BookingEmailRequest):
         }
 
 
+
+# =========================
+# FUNZIONI WHATSAPP / TWILIO
+# =========================
+
+ITALIAN_MONTHS = {
+    "gennaio": 1,
+    "febbraio": 2,
+    "marzo": 3,
+    "aprile": 4,
+    "maggio": 5,
+    "giugno": 6,
+    "luglio": 7,
+    "agosto": 8,
+    "settembre": 9,
+    "ottobre": 10,
+    "novembre": 11,
+    "dicembre": 12
+}
+
+
+def twilio_xml_response(message: str) -> Response:
+    escaped_reply = escape(str(message))
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Response>\n'
+        f'    <Message>{escaped_reply}</Message>\n'
+        '</Response>'
+    )
+    return Response(content=twiml, media_type="application/xml")
+
+
+def get_whatsapp_session(from_number: str) -> dict:
+    key = str(from_number or "unknown").strip()
+
+    if key not in WHATSAPP_SESSIONS:
+        WHATSAPP_SESSIONS[key] = {
+            "structure": "",
+            "check_in": "",
+            "check_out": "",
+            "guests": 0,
+            "last_availability": None,
+            "last_updated": datetime.utcnow().isoformat()
+        }
+
+    return WHATSAPP_SESSIONS[key]
+
+
+def reset_whatsapp_session(from_number: str):
+    if from_number in WHATSAPP_SESSIONS:
+        del WHATSAPP_SESSIONS[from_number]
+
+
+def parse_italian_date_parts(day: int, month_name: str, year: Optional[int] = None) -> Optional[str]:
+    month = ITALIAN_MONTHS.get(str(month_name).lower().strip())
+
+    if not month:
+        return None
+
+    if not year:
+        year = date.today().year
+
+    try:
+        parsed = date(int(year), int(month), int(day))
+        return parsed.isoformat()
+    except Exception:
+        return None
+
+
+def extract_dates_from_message(text: str) -> Tuple[str, str]:
+    text_l = text.lower()
+    today = date.today()
+
+    iso_dates = re.findall(r"\b(\d{4}-\d{2}-\d{2})\b", text_l)
+
+    if len(iso_dates) >= 2:
+        return iso_dates[0], iso_dates[1]
+
+    numeric_dates = re.findall(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b", text_l)
+
+    if len(numeric_dates) >= 2:
+        parsed_dates = []
+
+        for d, m, y in numeric_dates[:2]:
+            year = int(y)
+            if year < 100:
+                year += 2000
+
+            try:
+                parsed_dates.append(date(year, int(m), int(d)).isoformat())
+            except Exception:
+                pass
+
+        if len(parsed_dates) >= 2:
+            return parsed_dates[0], parsed_dates[1]
+
+    m = re.search(
+        r"dal\s+(\d{1,2})\s+al\s+(\d{1,2})\s+([a-zàèéìòù]+)(?:\s+(\d{4}))?",
+        text_l
+    )
+
+    if m:
+        day_in = int(m.group(1))
+        day_out = int(m.group(2))
+        month_name = m.group(3)
+        year = int(m.group(4)) if m.group(4) else today.year
+
+        check_in = parse_italian_date_parts(day_in, month_name, year)
+        check_out = parse_italian_date_parts(day_out, month_name, year)
+
+        if check_in and check_out:
+            return check_in, check_out
+
+    named_dates = re.findall(r"\b(\d{1,2})\s+([a-zàèéìòù]+)(?:\s+(\d{4}))?\b", text_l)
+    parsed_named = []
+
+    for d, month_name, y in named_dates:
+        if month_name not in ITALIAN_MONTHS:
+            continue
+
+        year = int(y) if y else today.year
+        parsed = parse_italian_date_parts(int(d), month_name, year)
+
+        if parsed:
+            parsed_named.append(parsed)
+
+    if len(parsed_named) >= 2:
+        return parsed_named[0], parsed_named[1]
+
+    if "stasera" in text_l or "questa sera" in text_l:
+        return today.isoformat(), (today + timedelta(days=1)).isoformat()
+
+    if "domani" in text_l:
+        tomorrow = today + timedelta(days=1)
+        return tomorrow.isoformat(), (tomorrow + timedelta(days=1)).isoformat()
+
+    return "", ""
+
+
+def extract_guests_from_message(text: str) -> int:
+    text_l = text.lower()
+
+    m = re.search(r"\b(\d+)\s*(?:persone|persona|ospiti|ospite|adulti|adulto|pax)\b", text_l)
+
+    if m:
+        return safe_int(m.group(1), 0)
+
+    words = {
+        "uno": 1,
+        "una": 1,
+        "due": 2,
+        "tre": 3,
+        "quattro": 4,
+        "cinque": 5,
+        "sei": 6,
+        "sette": 7,
+        "otto": 8
+    }
+
+    for word, value in words.items():
+        if re.search(rf"\b{word}\s+(?:persone|ospiti|adulti|pax)\b", text_l):
+            return value
+
+    return 0
+
+
+def extract_structure_from_message(text: str) -> str:
+    text_l = text.lower()
+
+    if any(k in text_l for k in ["benevento", "janara", "arco", "traiano", "duomo", "teatro"]):
+        return "Benevento"
+
+    if any(k in text_l for k in ["milano", "milan", "magenta"]):
+        return "Milano"
+
+    if any(k in text_l for k in ["budapest", "kiraly", "ungheria"]):
+        return "Budapest"
+
+    m = re.search(r"\b(?:a|ad|per|struttura|città|citta)\s+([a-zàèéìòù\s]{3,40})", text_l)
+
+    if m:
+        candidate = m.group(1).strip()
+        candidate = re.split(
+            r"\b(?:dal|check|per\s+\d|con\s+\d|a\s+\d|stasera|domani)\b",
+            candidate
+        )[0].strip()
+
+        if candidate:
+            return candidate.title()
+
+    return ""
+
+
+def extract_contact_data(text: str) -> dict:
+    email_match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", text)
+    phone_match = re.search(r"(\+?\d[\d\s\.\-]{7,}\d)", text)
+
+    email = email_match.group(0).strip() if email_match else ""
+    telefono = phone_match.group(1).strip() if phone_match else ""
+
+    cleaned = text
+
+    if email:
+        cleaned = cleaned.replace(email, " ")
+
+    if telefono:
+        cleaned = cleaned.replace(telefono, " ")
+
+    cleaned = re.sub(
+        r"\b(nome|mi chiamo|sono|email|mail|telefono|tel|cellulare|riepilogo|prenotazione|confermo)\b",
+        " ",
+        cleaned,
+        flags=re.I
+    )
+    cleaned = re.sub(r"[^A-Za-zÀ-ÿ\s']", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    nome = cleaned.title() if len(cleaned) >= 2 else ""
+
+    return {
+        "nome": nome,
+        "email": email,
+        "telefono": telefono
+    }
+
+
+def is_availability_intent(text: str) -> bool:
+    text_l = text.lower()
+    keywords = [
+        "disponibilità",
+        "disponibilita",
+        "disponibile",
+        "camera",
+        "camere",
+        "prenotare",
+        "prenotazione",
+        "soggiorno",
+        "notte",
+        "notti",
+        "prezzo",
+        "quanto costa",
+        "avete posto"
+    ]
+
+    return any(k in text_l for k in keywords)
+
+
+def is_confirmation_intent(text: str) -> bool:
+    text_l = text.lower().strip()
+
+    return any(k in text_l for k in [
+        "si",
+        "sì",
+        "ok",
+        "va bene",
+        "confermo",
+        "procedi",
+        "mandami",
+        "invia",
+        "riepilogo",
+        "prenota"
+    ])
+
+
+def build_missing_fields_question(session: dict) -> str:
+    missing = []
+
+    if not session.get("structure"):
+        missing.append("la struttura o città")
+
+    if not session.get("check_in") or not session.get("check_out"):
+        missing.append("data di arrivo e data di partenza")
+
+    if not session.get("guests"):
+        missing.append("numero di ospiti")
+
+    if not missing:
+        return ""
+
+    return (
+        "Certo, ti aiuto volentieri. "
+        "Per controllare disponibilità e prezzo mi serve: "
+        + ", ".join(missing)
+        + "."
+    )
+
+
+def update_session_from_message(session: dict, message: str):
+    structure = extract_structure_from_message(message)
+
+    if structure:
+        session["structure"] = structure
+
+    check_in, check_out = extract_dates_from_message(message)
+
+    if check_in:
+        session["check_in"] = check_in
+
+    if check_out:
+        session["check_out"] = check_out
+
+    guests = extract_guests_from_message(message)
+
+    if guests > 0:
+        session["guests"] = guests
+
+    session["last_updated"] = datetime.utcnow().isoformat()
+
+
+def try_check_availability_for_session(session: dict) -> dict:
+    return check_availability(
+        AvailabilityRequest(
+            structure=str(session.get("structure", "")),
+            check_in=str(session.get("check_in", "")),
+            check_out=str(session.get("check_out", "")),
+            guests=int(session.get("guests", 0))
+        )
+    )
+
+
+def build_availability_reply(session: dict, result: dict) -> str:
+    session["last_availability"] = result
+
+    reply = result.get("message", "Non sono riuscito a controllare la disponibilità.")
+
+    if result.get("available"):
+        url_camera = str(result.get("url_camera", "")).strip()
+
+        if url_camera:
+            reply += f"\n\nPuoi vedere la camera qui:\n{url_camera}"
+
+        reply += (
+            "\n\nVuoi ricevere il riepilogo della prenotazione via email "
+            "con eventuale link di pagamento? "
+            "Puoi scrivermi nome, email e telefono."
+        )
+
+    return reply
+
+
+def try_send_booking_summary_from_whatsapp(session: dict, contact: dict) -> str:
+    result = session.get("last_availability") or {}
+
+    if not result.get("available"):
+        return (
+            "Prima devo controllare una disponibilità valida. "
+            "Indicami struttura, date e numero di ospiti."
+        )
+
+    nome = contact.get("nome", "").strip()
+    email = contact.get("email", "").strip()
+    telefono = contact.get("telefono", "").strip()
+
+    missing = []
+
+    if not nome:
+        missing.append("nome")
+
+    if not email:
+        missing.append("email")
+
+    if not telefono:
+        missing.append("telefono")
+
+    if missing:
+        return (
+            "Per inviarti il riepilogo mi manca: "
+            + ", ".join(missing)
+            + ". Puoi scriverli in un unico messaggio?"
+        )
+
+    payment_link = ""
+
+    try:
+        checkout_result = create_sumup_checkout_link(
+            SumupCheckoutRequest(
+                nome=nome,
+                email=email,
+                telefono=telefono,
+                struttura=str(session.get("structure", "")),
+                camera=str(result.get("room_name", "")),
+                camera_key=str(result.get("camera_key", "")),
+                check_in=str(session.get("check_in", "")),
+                check_out=str(session.get("check_out", "")),
+                ospiti=int(session.get("guests", 0)),
+                totale=float(result.get("total_price", 0))
+            )
+        )
+
+        if checkout_result.get("success"):
+            payment_link = str(checkout_result.get("payment_link", "")).strip()
+
+    except Exception as e:
+        print(f"Errore creazione checkout SumUp da WhatsApp: {str(e)}")
+
+    try:
+        email_result = send_booking_email(
+            BookingEmailRequest(
+                nome=nome,
+                email=email,
+                telefono=telefono,
+                struttura=str(session.get("structure", "")),
+                camera=str(result.get("room_name", "")),
+                check_in=str(session.get("check_in", "")),
+                check_out=str(session.get("check_out", "")),
+                ospiti=int(session.get("guests", 0)),
+                totale=float(result.get("total_price", 0)),
+                url_camera=str(result.get("url_camera", "")),
+                payment_link=payment_link
+            )
+        )
+
+        if email_result.get("success"):
+            reply = f"Perfetto {nome}, ti ho inviato il riepilogo a {email}."
+
+            if payment_link:
+                reply += f"\n\nPuoi confermare anche da questo link SumUp:\n{payment_link}"
+            else:
+                reply += "\n\nNell'email trovi anche le istruzioni per il pagamento."
+
+            return reply
+
+        return (
+            "Ho provato a inviare l'email, ma c'è stato un problema: "
+            + str(email_result.get("message", "errore sconosciuto"))
+        )
+
+    except Exception as e:
+        return f"Mi dispiace, non sono riuscito a inviare il riepilogo. Errore: {str(e)}"
+
+
+def get_fallback_ai_reply(message: str, session: dict) -> str:
+    if not _openai_client:
+        return ""
+
+    try:
+        prompt = (
+            "Sei l'assistente WhatsApp di Janara Hospitality. "
+            "Rispondi in italiano, in modo breve e cortese. "
+            "Non inventare disponibilità o prezzi. "
+            "Se mancano dati, chiedi struttura/città, date e numero ospiti. "
+            f"Stato conversazione: {session}. "
+            f"Messaggio cliente: {message}"
+        )
+
+        completion = _openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Sei un assistente WhatsApp per prenotazioni hospitality."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.2,
+            max_tokens=160,
+            timeout=6
+        )
+
+        return completion.choices[0].message.content.strip()
+
+    except Exception as e:
+        print(f"Errore OpenAI WhatsApp: {str(e)}")
+        return ""
+
+
+def handle_whatsapp_message(from_number: str, incoming_message: str) -> str:
+    message = str(incoming_message or "").strip()
+
+    if not message:
+        return "Ciao, sono l'assistente WhatsApp di Janara. Come posso aiutarti?"
+
+    if message.lower().strip() in ["reset", "ricomincia", "annulla"]:
+        reset_whatsapp_session(from_number)
+        return "Va bene, ricominciamo da capo. Dimmi pure struttura, date e numero di ospiti."
+
+    session = get_whatsapp_session(from_number)
+    update_session_from_message(session, message)
+
+    contact = extract_contact_data(message)
+    has_contact_data = bool(contact.get("email") or contact.get("telefono"))
+
+    if has_contact_data and session.get("last_availability"):
+        return try_send_booking_summary_from_whatsapp(session, contact)
+
+    if is_availability_intent(message) or session.get("structure") or session.get("check_in") or session.get("guests"):
+        missing_question = build_missing_fields_question(session)
+
+        if missing_question:
+            return missing_question
+
+        try:
+            result = try_check_availability_for_session(session)
+            return build_availability_reply(session, result)
+        except Exception as e:
+            return f"Mi dispiace, ho avuto un problema nel controllo disponibilità: {str(e)}"
+
+    if is_confirmation_intent(message) and session.get("last_availability"):
+        return (
+            "Perfetto. Per inviarti il riepilogo della prenotazione, "
+            "scrivimi nome, email e telefono."
+        )
+
+    ai_reply = get_fallback_ai_reply(message, session)
+
+    if ai_reply:
+        return ai_reply
+
+    return (
+        "Ciao, sono l'assistente WhatsApp di Janara. "
+        "Posso aiutarti con disponibilità, prezzi e riepilogo prenotazione. "
+        "Scrivimi ad esempio: “Vorrei una camera a Benevento dal 20 al 22 giugno 2026 per 2 persone”."
+    )
+
+
 # =========================
 # ENDPOINT WHATSAPP / TWILIO
 # =========================
@@ -1588,7 +2127,9 @@ def whatsapp_webhook_test():
     return {
         "status": "ok",
         "message": "Webhook WhatsApp attivo. In Twilio usa questo endpoint con metodo POST.",
-        "endpoint": "/whatsapp-webhook"
+        "endpoint": "/whatsapp-webhook",
+        "openai_configured": bool(OPENAI_API_KEY),
+        "openai_available": bool(_openai_client)
     }
 
 
@@ -1604,86 +2145,28 @@ async def whatsapp_webhook(request: Request):
     La risposta viene restituita in formato TwiML XML.
     """
 
-    raw_body = await request.body()
-    parsed_body = parse_qs(raw_body.decode("utf-8", errors="ignore"))
+    try:
+        raw_body = await request.body()
+        parsed_body = parse_qs(raw_body.decode("utf-8", errors="ignore"))
 
-    incoming_message = str(parsed_body.get("Body", [""])[0]).strip()
-    from_number = str(parsed_body.get("From", [""])[0]).strip()
+        incoming_message = str(parsed_body.get("Body", [""])[0]).strip()
+        from_number = str(parsed_body.get("From", [""])[0]).strip()
 
-    print(f"Messaggio WhatsApp ricevuto da {from_number}: {incoming_message}")
+        print(f"Messaggio WhatsApp ricevuto da {from_number}: {incoming_message}")
 
-    text = incoming_message.lower().strip()
+        reply = handle_whatsapp_message(
+            from_number=from_number,
+            incoming_message=incoming_message
+        )
 
-    reply = (
-        "Ciao, sono l'assistente WhatsApp di Janara. "
-        "Posso aiutarti a controllare disponibilità e prezzi.\n\n"
-        "Per fare una prova scrivi così:\n"
-        "disponibilità Benevento 2026-06-20 2026-06-22 2\n\n"
-        "Formato:\n"
-        "disponibilità città check-in check-out ospiti"
-    )
+        return twilio_xml_response(reply)
 
-    # Esempio accettato:
-    # disponibilità Benevento 2026-06-20 2026-06-22 2
-    pattern = (
-        r"(?:disponibilita|disponibilità)\s+"
-        r"(.+?)\s+"
-        r"(\d{4}-\d{2}-\d{2})\s+"
-        r"(\d{4}-\d{2}-\d{2})\s+"
-        r"(\d+)"
-    )
-
-    match = re.search(pattern, text)
-
-    if match:
-        struttura = match.group(1).strip()
-        check_in = match.group(2).strip()
-        check_out = match.group(3).strip()
-        ospiti = int(match.group(4).strip())
-
-        try:
-            result = check_availability(
-                AvailabilityRequest(
-                    structure=struttura,
-                    check_in=check_in,
-                    check_out=check_out,
-                    guests=ospiti
-                )
-            )
-
-            reply = result.get(
-                "message",
-                "Non sono riuscito a controllare la disponibilità."
-            )
-
-            if result.get("available"):
-                url_camera = str(result.get("url_camera", "")).strip()
-
-                if url_camera:
-                    reply += f"\n\nPuoi vedere la camera qui:\n{url_camera}"
-
-                reply += (
-                    "\n\nVuoi ricevere il riepilogo della prenotazione via email? "
-                    "Rispondi indicando nome, email e telefono."
-                )
-
-        except Exception as e:
-            reply = (
-                "Mi dispiace, ho avuto un problema nel controllo disponibilità. "
-                f"Errore: {str(e)}"
-            )
-
-    # Risposta Twilio in formato TwiML
-    escaped_reply = escape(reply)
-    twiml = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<Response>\n'
-        f'    <Message>{escaped_reply}</Message>\n'
-        '</Response>'
-    )
-
-    return Response(content=twiml, media_type="application/xml")
-
+    except Exception as e:
+        print(f"Errore generale webhook WhatsApp: {str(e)}")
+        return twilio_xml_response(
+            "Mi dispiace, ho avuto un problema tecnico. "
+            "Riprova tra qualche istante oppure contatta direttamente la struttura."
+        )
 
 
 if __name__ == "__main__":
