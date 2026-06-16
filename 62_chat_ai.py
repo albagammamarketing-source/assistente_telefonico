@@ -228,7 +228,8 @@ def append_prenotazione_ai(row: List):
         }
     ).execute()
 
-    def append_whatsapp_chat_log(row: List):
+
+def append_whatsapp_chat_log(row: List):
     service = get_sheets_service()
 
     service.spreadsheets().values().append(
@@ -240,6 +241,7 @@ def append_prenotazione_ai(row: List):
             "values": [row]
         }
     ).execute()
+
 
 def find_prenotazione_by_checkout_id(checkout_id: str) -> Tuple[Optional[int], Optional[dict], List[str]]:
     values = get_prenotazioni_values()
@@ -2171,30 +2173,30 @@ async def whatsapp_webhook(request: Request):
 
         print(f"Messaggio WhatsApp ricevuto da {from_number}: {incoming_message}")
 
-       reply = handle_whatsapp_message(
-    from_number=from_number,
-    incoming_message=incoming_message
-)
+        reply = handle_whatsapp_message(
+            from_number=from_number,
+            incoming_message=incoming_message
+        )
 
-try:
-    session = WHATSAPP_SESSIONS.get(from_number, {})
+        try:
+            session = WHATSAPP_SESSIONS.get(from_number, {})
 
-    append_whatsapp_chat_log([
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        from_number,
-        incoming_message,
-        reply,
-        session.get("structure", ""),
-        session.get("check_in", ""),
-        session.get("check_out", ""),
-        session.get("guests", ""),
-        "OK"
-    ])
+            append_whatsapp_chat_log([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                from_number,
+                incoming_message,
+                reply,
+                session.get("structure", ""),
+                session.get("check_in", ""),
+                session.get("check_out", ""),
+                session.get("guests", ""),
+                "OK"
+            ])
 
-except Exception as log_error:
-    print(f"Errore salvataggio log WhatsApp: {str(log_error)}")
+        except Exception as log_error:
+            print(f"Errore salvataggio log WhatsApp: {str(log_error)}")
 
-return twilio_xml_response(reply)
+        return twilio_xml_response(reply)
 
     except Exception as e:
         print(f"Errore generale webhook WhatsApp: {str(e)}")
@@ -2202,7 +2204,6 @@ return twilio_xml_response(reply)
             "Mi dispiace, ho avuto un problema tecnico. "
             "Riprova tra qualche istante oppure contatta direttamente la struttura."
         )
-
 
 if __name__ == "__main__":
     import uvicorn
