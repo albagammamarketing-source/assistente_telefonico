@@ -53,6 +53,11 @@ GID_PREZZI = os.environ.get("GID_PREZZI", "415348027")
 
 PRENOTAZIONI_SHEET_NAME = os.environ.get("PRENOTAZIONI_SHEET_NAME", "PRENOTAZIONI_AI")
 
+WHATSAPP_LOG_SHEET_NAME = os.environ.get(
+    "WHATSAPP_LOG_SHEET_NAME",
+    "WHATSAPP_CHAT_LOG"
+)
+
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "8"))
 
 SHEET_CACHE_SECONDS = int(os.environ.get("SHEET_CACHE_SECONDS", "300"))
@@ -223,6 +228,18 @@ def append_prenotazione_ai(row: List):
         }
     ).execute()
 
+    def append_whatsapp_chat_log(row: List):
+    service = get_sheets_service()
+
+    service.spreadsheets().values().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{WHATSAPP_LOG_SHEET_NAME}!A:I",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={
+            "values": [row]
+        }
+    ).execute()
 
 def find_prenotazione_by_checkout_id(checkout_id: str) -> Tuple[Optional[int], Optional[dict], List[str]]:
     values = get_prenotazioni_values()
@@ -2154,12 +2171,30 @@ async def whatsapp_webhook(request: Request):
 
         print(f"Messaggio WhatsApp ricevuto da {from_number}: {incoming_message}")
 
-        reply = handle_whatsapp_message(
-            from_number=from_number,
-            incoming_message=incoming_message
-        )
+       reply = handle_whatsapp_message(
+    from_number=from_number,
+    incoming_message=incoming_message
+)
 
-        return twilio_xml_response(reply)
+try:
+    session = WHATSAPP_SESSIONS.get(from_number, {})
+
+    append_whatsapp_chat_log([
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        from_number,
+        incoming_message,
+        reply,
+        session.get("structure", ""),
+        session.get("check_in", ""),
+        session.get("check_out", ""),
+        session.get("guests", ""),
+        "OK"
+    ])
+
+except Exception as log_error:
+    print(f"Errore salvataggio log WhatsApp: {str(log_error)}")
+
+return twilio_xml_response(reply)
 
     except Exception as e:
         print(f"Errore generale webhook WhatsApp: {str(e)}")
