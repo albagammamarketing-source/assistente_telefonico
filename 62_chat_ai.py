@@ -18,6 +18,7 @@ from icalendar import Calendar
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 try:
     from openai import OpenAI
@@ -58,6 +59,22 @@ WHATSAPP_LOG_SHEET_NAME = os.environ.get(
     "WHATSAPP_CHAT_LOG"
 )
 
+# WhatsApp: numero operatore per richieste urgenti / conferme.
+WHATSAPP_OPERATOR_PHONE = os.environ.get(
+    "WHATSAPP_OPERATOR_PHONE",
+    "+39 375 562 6515"
+)
+
+# Cartella Google Drive dove salvare le foto dei documenti ricevuti via WhatsApp.
+WHATSAPP_DOCUMENTS_FOLDER_ID = os.environ.get(
+    "WHATSAPP_DOCUMENTS_FOLDER_ID",
+    "1j68I_QeTgvbYlWn4POAU-6FpQ1WcFm1b"
+)
+
+# Twilio: necessari per scaricare allegati/foto WhatsApp da MediaUrl0.
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "8"))
 
 SHEET_CACHE_SECONDS = int(os.environ.get("SHEET_CACHE_SECONDS", "300"))
@@ -87,7 +104,8 @@ GOOGLE_APPLICATION_CREDENTIALS = os.environ.get(
 
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/spreadsheets"
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
 ]
 
 # OpenAI opzionale. Il webhook WhatsApp funziona anche senza OpenAI,
@@ -114,6 +132,7 @@ _ical_cache: Dict[str, Tuple[float, List[Tuple[date, date]]]] = {}
 
 _google_sheets_service = None
 _google_calendar_service = None
+_google_drive_service = None
 
 
 # =========================
@@ -194,6 +213,16 @@ def get_calendar_service():
     return _google_calendar_service
 
 
+def get_drive_service():
+    global _google_drive_service
+
+    if _google_drive_service is None:
+        credentials = get_google_credentials()
+        _google_drive_service = build("drive", "v3", credentials=credentials)
+
+    return _google_drive_service
+
+
 def col_to_letter(col_index: int) -> str:
     result = ""
 
@@ -234,7 +263,7 @@ def append_whatsapp_chat_log(row: List):
 
     service.spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{WHATSAPP_LOG_SHEET_NAME}!A:J",
+        range=f"{WHATSAPP_LOG_SHEET_NAME}!A:K",
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={
@@ -1639,30 +1668,30 @@ ITALIAN_MONTHS = {
     "dicembre": 12
 }
 
-WHATSAPP_OPERATOR_PHONE = os.environ.get(
-    "WHATSAPP_OPERATOR_PHONE",
-    "+39 375 562 6515"
-)
 
-WHATSAPP_DEFAULT_STRUCTURE = os.environ.get(
-    "WHATSAPP_DEFAULT_STRUCTURE",
-    "Benevento"
-)
-
-WHATSAPP_URGENT_NOTE = "RICHIESTA URGENTE - QUESTA SERA"
-WHATSAPP_OPERATOR_NOTE = "RICHIESTA OPERATORE"
-
-# Associazione camere per zona usata SOLO nel flusso WhatsApp guidato.
-# Non modifica la logica voce/Vapi né l'endpoint generale /check-availability.
-WHATSAPP_ZONE_ROOM_ALIASES = {
-    "Via Annunziata": [
-        "santa sofia",
-        "arco di traiano",
-    ],
-    "Triggio": [
-        "teatro romano",
-        "mura longobarde",
-    ],
+ZONE_CAMERA_MAP = {
+    "via_annunziata": {
+        "label": "Via Annunziata / Centro storico",
+        "allowed_camera_keywords": [
+            "santa sofia",
+            "arco di traiano"
+        ]
+    },
+    "triggio": {
+        "label": "Triggio",
+        "allowed_camera_keywords": [
+            "teatro romano",
+            "mura longobarde"
+        ]
+    },
+    "centro": {
+        "label": "Nei pressi del centro",
+        "allowed_camera_keywords": []
+    },
+    "nessuna_preferenza": {
+        "label": "Nessuna preferenza",
+        "allowed_camera_keywords": []
+    }
 }
 
 
@@ -1677,8 +1706,18 @@ def twilio_xml_response(message: str) -> Response:
     return Response(content=twiml, media_type="application/xml")
 
 
-def now_utc_iso() -> str:
-    return datetime.utcnow().isoformat()
+def normalize_for_match(value: str) -> str:
+    value = normalize(value)
+    value = re.sub(r"[^a-z0-9àèéìòù\s]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def format_euro(value) -> str:
+    try:
+        return f"{float(value):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return str(value)
 
 
 def get_whatsapp_session(from_number: str) -> dict:
@@ -1687,17 +1726,22 @@ def get_whatsapp_session(from_number: str) -> dict:
     if key not in WHATSAPP_SESSIONS:
         WHATSAPP_SESSIONS[key] = {
             "step": "ask_guests",
-            "structure": WHATSAPP_DEFAULT_STRUCTURE,
+            "structure": "Benevento",
             "zona": "",
             "zona_label": "",
+            "allowed_camera_keywords": [],
             "check_in": "",
             "check_out": "",
             "guests": 0,
-            "date_choice": "",
             "last_availability": None,
             "urgent_request": False,
             "urgent_note": "",
-            "last_updated": now_utc_iso()
+            "contact_name": "",
+            "contact_phone": "",
+            "contact_email": "",
+            "document_link": "",
+            "document_status": "",
+            "last_updated": datetime.utcnow().isoformat()
         }
 
     return WHATSAPP_SESSIONS[key]
@@ -1794,18 +1838,10 @@ def extract_dates_from_message(text: str) -> Tuple[str, str]:
     return "", ""
 
 
-def clean_whatsapp_choice(text: str) -> str:
-    value = str(text or "").lower().strip()
-    value = value.replace(")", "").replace(".", "").replace("-", " ")
-    value = re.sub(r"\s+", " ", value).strip()
-    return value
-
-
 def extract_guests_from_message(text: str) -> int:
-    text_l = clean_whatsapp_choice(text)
+    text_l = str(text or "").lower().strip()
 
-    # Scelte guidate.
-    choice_map = {
+    direct_map = {
         "a": 1,
         "1": 1,
         "b": 2,
@@ -1813,20 +1849,22 @@ def extract_guests_from_message(text: str) -> int:
         "c": 3,
         "3": 3,
         "d": 4,
-        "4": 4,
-        "e": 5,
-        "5": 5
+        "4": 4
     }
 
-    if text_l in choice_map:
-        return choice_map[text_l]
+    if text_l in direct_map:
+        return direct_map[text_l]
 
-    # Frasi libere frequenti: "siamo 2", "siamo in due", "per 2", "in 2".
-    m = re.search(r"\b(?:siamo|saremo|in|per)\s+(?:in\s+)?(\d+)\b", text_l)
+    if text_l in ["e", "5", "più di 4", "piu di 4", "oltre 4"]:
+        return 5
+
+    m = re.search(r"\b(?:siamo|siamo in|per|in)\s+(\d+)\b", text_l)
+
     if m:
         return safe_int(m.group(1), 0)
 
     m = re.search(r"\b(\d+)\s*(?:persone|persona|ospiti|ospite|adulti|adulto|pax)\b", text_l)
+
     if m:
         return safe_int(m.group(1), 0)
 
@@ -1843,101 +1881,10 @@ def extract_guests_from_message(text: str) -> int:
     }
 
     for word, value in words.items():
-        if re.search(rf"\b(?:siamo|saremo|in|per)\s+(?:in\s+)?{word}\b", text_l):
-            return value
-
-        if re.search(rf"\b{word}\s+(?:persone|ospiti|adulti|pax)\b", text_l):
+        if re.search(rf"\b(?:siamo\s+in\s+|siamo\s+|per\s+|in\s+)?{word}\b", text_l):
             return value
 
     return 0
-
-
-def parse_zone_choice(text: str) -> Tuple[str, str]:
-    value = clean_whatsapp_choice(text)
-
-    if value in ["a", "1", "via annunziata", "annunziata", "centro storico"]:
-        return "Via Annunziata", "Via Annunziata / Centro storico"
-
-    if value in ["b", "2", "triggio"]:
-        return "Triggio", "Triggio"
-
-    if value in ["c", "3", "centro", "pressi del centro", "nei pressi del centro"]:
-        return "Centro", "Nei pressi del centro"
-
-    if value in ["d", "4", "nessuna", "nessuna preferenza", "non ho preferenze", "indifferente"]:
-        return "", "Nessuna preferenza"
-
-    # Evita di prendere parole generiche come struttura.
-    if any(k in value for k in ["annunziata", "centro storico"]):
-        return "Via Annunziata", "Via Annunziata / Centro storico"
-
-    if "triggio" in value:
-        return "Triggio", "Triggio"
-
-    if "centro" in value or "centrale" in value:
-        return "Centro", "Nei pressi del centro"
-
-    return "", ""
-
-
-def parse_date_type_choice(text: str) -> str:
-    value = clean_whatsapp_choice(text)
-
-    if value in ["a", "1", "questa sera", "stasera"] or "questa sera" in value or "stasera" in value:
-        return "tonight"
-
-    if value in ["b", "2", "altra data", "altre date", "data futura", "altra"]:
-        return "other"
-
-    return ""
-
-
-def parse_after_availability_choice(text: str) -> str:
-    value = clean_whatsapp_choice(text)
-
-    if value in ["a", "1", "si", "sì", "ok", "confermo", "procedi"]:
-        return "summary"
-
-    if value in ["b", "2", "no", "annulla"]:
-        return "stop"
-
-    if value in ["c", "3", "operatore", "parlare con operatore", "voglio parlare con un operatore"]:
-        return "operator"
-
-    return ""
-
-
-def extract_structure_from_message(text: str) -> str:
-    text_l = text.lower()
-
-    # Nel flusso WhatsApp guidato la struttura predefinita è Benevento.
-    # La funzione resta disponibile per messaggi liberi e compatibilità.
-    if any(k in text_l for k in ["benevento", "janara", "arco", "traiano", "duomo", "teatro"]):
-        return "Benevento"
-
-    if any(k in text_l for k in ["milano", "milan", "magenta"]):
-        return "Milano"
-
-    if any(k in text_l for k in ["budapest", "kiraly", "ungheria"]):
-        return "Budapest"
-
-    blocked_generic = ["centrale", "centro", "zona centrale", "vicino al centro"]
-    if any(k in text_l for k in blocked_generic):
-        return ""
-
-    m = re.search(r"\b(?:a|ad|per|struttura|città|citta)\s+([a-zàèéìòù\s]{3,40})", text_l)
-
-    if m:
-        candidate = m.group(1).strip()
-        candidate = re.split(
-            r"\b(?:dal|check|per\s+\d|con\s+\d|a\s+\d|stasera|domani)\b",
-            candidate
-        )[0].strip()
-
-        if candidate and candidate.lower() not in blocked_generic:
-            return candidate.title()
-
-    return ""
 
 
 def extract_contact_data(text: str) -> dict:
@@ -1956,7 +1903,7 @@ def extract_contact_data(text: str) -> dict:
         cleaned = cleaned.replace(telefono, " ")
 
     cleaned = re.sub(
-        r"\b(nome|mi chiamo|sono|email|mail|telefono|tel|cellulare|riepilogo|prenotazione|confermo)\b",
+        r"\b(nome|mi chiamo|sono|email|mail|telefono|tel|cellulare|riepilogo|prenotazione|confermo|documento|carta|identità|identita)\b",
         " ",
         cleaned,
         flags=re.I
@@ -1973,49 +1920,22 @@ def extract_contact_data(text: str) -> dict:
     }
 
 
-def is_availability_intent(text: str) -> bool:
-    text_l = text.lower()
-    keywords = [
-        "disponibilità",
-        "disponibilita",
-        "disponibile",
-        "camera",
-        "camere",
-        "prenotare",
-        "prenotazione",
-        "soggiorno",
-        "notte",
-        "notti",
-        "prezzo",
-        "quanto costa",
-        "avete posto"
-    ]
-
-    return any(k in text_l for k in keywords)
-
-
 def is_confirmation_intent(text: str) -> bool:
     text_l = text.lower().strip()
 
-    return any(k in text_l for k in [
-        "si",
-        "sì",
-        "ok",
-        "va bene",
-        "confermo",
-        "procedi",
-        "mandami",
-        "invia",
-        "riepilogo",
-        "prenota"
-    ])
+    return text_l in ["a", "si", "sì", "ok", "va bene", "confermo", "procedi", "prenota"]
+
+
+def is_operator_intent(text: str) -> bool:
+    text_l = str(text or "").lower().strip()
+
+    return text_l in ["c", "operatore", "parlare con operatore", "voglio parlare con un operatore"] or "operatore" in text_l
 
 
 def build_guests_menu() -> str:
     return (
-        "Ciao, sono l'assistente Janara.\n"
+        "Ciao, sono l'assistente WhatsApp di Janara.\n"
         "Ti aiuto a trovare la soluzione più adatta per il tuo soggiorno.\n\n"
-        "Rispondi scegliendo una delle opzioni.\n\n"
         "1. Quante persone siete?\n\n"
         "a) 1 persona\n"
         "b) 2 persone\n"
@@ -2036,7 +1956,7 @@ def build_zone_menu() -> str:
     )
 
 
-def build_date_type_menu() -> str:
+def build_date_choice_menu() -> str:
     return (
         "3. Per quali date vuoi controllare la disponibilità?\n\n"
         "a) Questa sera\n"
@@ -2044,19 +1964,7 @@ def build_date_type_menu() -> str:
     )
 
 
-def build_ask_dates_message() -> str:
-    return (
-        "Va bene. Scrivi le date del soggiorno.\n\n"
-        "Esempio:\n"
-        "dal 20 al 22 giugno 2026"
-    )
-
-
-def build_operator_message(session: Optional[dict] = None) -> str:
-    if session is not None:
-        session["urgent_note"] = WHATSAPP_OPERATOR_NOTE
-        session["last_updated"] = now_utc_iso()
-
+def build_operator_reply() -> str:
     return (
         "Va bene, puoi chiamarci o scriverci al numero:\n\n"
         f"{WHATSAPP_OPERATOR_PHONE}\n\n"
@@ -2065,132 +1973,63 @@ def build_operator_message(session: Optional[dict] = None) -> str:
     )
 
 
-def build_missing_fields_question(session: dict) -> str:
-    missing = []
+def parse_zone_choice(message: str) -> Tuple[str, str, List[str]]:
+    text_l = str(message or "").lower().strip()
 
-    if not session.get("guests"):
-        missing.append("numero di ospiti")
+    if text_l in ["a", "1", "via annunziata", "annunziata", "centro storico"]:
+        zone_key = "via_annunziata"
+    elif text_l in ["b", "2", "triggio"]:
+        zone_key = "triggio"
+    elif text_l in ["c", "3", "centro", "nei pressi del centro", "pressi del centro"]:
+        zone_key = "centro"
+    elif text_l in ["d", "4", "nessuna preferenza", "indifferente", "non ho preferenze"]:
+        zone_key = "nessuna_preferenza"
+    else:
+        return "", "", []
 
-    if not session.get("zona_label"):
-        missing.append("zona preferita")
-
-    if not session.get("check_in") or not session.get("check_out"):
-        missing.append("date del soggiorno")
-
-    if not missing:
-        return ""
-
-    return (
-        "Per continuare mi serve ancora: "
-        + ", ".join(missing)
-        + ".\n\n"
-        "Puoi scrivere 'reset' per ricominciare da capo."
-    )
+    zone_data = ZONE_CAMERA_MAP[zone_key]
+    return zone_key, zone_data["label"], zone_data["allowed_camera_keywords"]
 
 
-def update_session_from_message(session: dict, message: str):
-    # Compatibilità con messaggi liberi: aggiorna solo se il dato è realmente riconoscibile.
-    structure = extract_structure_from_message(message)
+def apply_room_filter_for_whatsapp(camere: pd.DataFrame, session: dict) -> pd.DataFrame:
+    allowed_keywords = session.get("allowed_camera_keywords") or []
 
-    if structure:
-        session["structure"] = structure
-
-    check_in, check_out = extract_dates_from_message(message)
-
-    if check_in:
-        session["check_in"] = check_in
-
-    if check_out:
-        session["check_out"] = check_out
-
-    guests = extract_guests_from_message(message)
-
-    if guests > 0 and not session.get("guests"):
-        session["guests"] = guests
-
-    session["last_updated"] = now_utc_iso()
-
-
-def camera_row_matches_aliases(row, aliases: List[str]) -> bool:
-    """
-    Controlla se una riga camera corrisponde a uno degli alias configurati.
-    Usa più colonne possibili per essere robusto rispetto ai nomi presenti nel foglio.
-    """
-    searchable_cols = [
-        "nome_camera",
-        "camera_key",
-        "nome_struttura",
-        "struttura_key",
-        "descrizione",
-        "camera",
-    ]
-
-    values = []
-    for col in searchable_cols:
-        if col in row.index:
-            values.append(str(row.get(col, "")))
-
-    haystack = normalize(" ".join(values))
-
-    return any(alias in haystack for alias in aliases)
-
-
-def filter_camere_by_zone(camere: pd.DataFrame, zona: str) -> pd.DataFrame:
-    if not zona:
+    if not allowed_keywords:
         return camere
 
-    camere = camere.copy()
-    zona_norm = normalize(zona)
+    allowed_norm = [normalize_for_match(k) for k in allowed_keywords]
 
-    # Prima regola: associazione fissa richiesta per WhatsApp.
-    # Via Annunziata -> Santa Sofia + Arco di Traiano
-    # Triggio -> Teatro Romano + Mura Longobarde
-    aliases = WHATSAPP_ZONE_ROOM_ALIASES.get(zona, [])
+    def row_matches(row) -> bool:
+        nome_camera = normalize_for_match(row.get("nome_camera", ""))
+        camera_key = normalize_for_match(row.get("camera_key", ""))
 
-    if aliases:
-        aliases_norm = [normalize(alias) for alias in aliases]
-        mapped = camere[
-            camere.apply(
-                lambda row: camera_row_matches_aliases(row, aliases_norm),
-                axis=1
-            )
-        ].copy()
+        return any(
+            keyword in nome_camera or keyword in camera_key
+            for keyword in allowed_norm
+        )
 
-        # Se la mappatura trova camere, usa solo quelle.
-        # Se per qualche motivo i nomi nel foglio sono diversi, passa al filtro per colonna zona.
-        if not mapped.empty:
-            return mapped
+    filtered = camere[camere.apply(row_matches, axis=1)].copy()
 
-    possible_cols = ["zona", "area", "quartiere", "posizione"]
+    # Sicurezza: se i nomi sul foglio sono diversi e non troviamo nulla,
+    # non blocchiamo il sistema. Proviamo comunque sul set completo.
+    if filtered.empty:
+        print("Filtro zona WhatsApp non ha trovato camere. Uso camere complete.")
+        return camere
 
-    for col in possible_cols:
-        if col in camere.columns:
-            filtered = camere[
-                camere[col]
-                .astype(str)
-                .str.lower()
-                .str.contains(zona_norm, na=False, regex=False)
-            ].copy()
-
-            if not filtered.empty:
-                return filtered
-
-    # Se il foglio non ha ancora la colonna zona o i nomi non corrispondono,
-    # non blocca la prenotazione: usa il normale controllo disponibilità.
-    return camere
+    return filtered
 
 
-def try_check_whatsapp_availability_for_session(session: dict) -> dict:
+def check_whatsapp_availability_for_session(session: dict) -> dict:
     try:
         check_in = parse_date(str(session.get("check_in", "")))
         check_out = parse_date(str(session.get("check_out", "")))
     except Exception:
-        return error_response("Le date devono essere nel formato YYYY-MM-DD.")
+        return error_response("Le date non sono valide.")
+
+    guests = int(session.get("guests", 0))
 
     if check_out <= check_in:
         return error_response("La data di check-out deve essere successiva al check-in.")
-
-    guests = int(session.get("guests", 0))
 
     if guests <= 0:
         return error_response("Il numero di ospiti deve essere maggiore di zero.")
@@ -2206,6 +2045,7 @@ def try_check_whatsapp_availability_for_session(session: dict) -> dict:
     camere.columns = [str(c).strip() for c in camere.columns]
 
     config_error = validate_camere_config(camere)
+
     if config_error:
         return error_response(config_error)
 
@@ -2213,56 +2053,30 @@ def try_check_whatsapp_availability_for_session(session: dict) -> dict:
         camere["attiva"].astype(str).str.upper().str.strip() == "SI"
     ].copy()
 
-    struttura_request = normalize(str(session.get("structure", WHATSAPP_DEFAULT_STRUCTURE)))
+    struttura_request = normalize(str(session.get("structure", "Benevento") or "Benevento"))
 
     camere_struttura = camere[
-        camere["nome_struttura"]
-        .astype(str)
-        .str.lower()
-        .str.contains(struttura_request, na=False, regex=False)
+        camere["nome_struttura"].astype(str).str.lower().str.contains(struttura_request, na=False, regex=False)
         |
-        camere["struttura_key"]
-        .astype(str)
-        .str.lower()
-        .str.contains(struttura_request, na=False, regex=False)
+        camere["struttura_key"].astype(str).str.lower().str.contains(struttura_request, na=False, regex=False)
         |
-        camere["citta"]
-        .astype(str)
-        .str.lower()
-        .str.contains(struttura_request, na=False, regex=False)
+        camere["citta"].astype(str).str.lower().str.contains(struttura_request, na=False, regex=False)
     ].copy()
 
     if camere_struttura.empty:
-        return error_response(
-            f"Non ho trovato la struttura richiesta: {session.get('structure', WHATSAPP_DEFAULT_STRUCTURE)}."
-        )
+        camere_struttura = camere.copy()
 
-    camere_struttura = filter_camere_by_zone(
-        camere_struttura,
-        str(session.get("zona", ""))
-    )
-
-    if camere_struttura.empty:
-        return error_response(
-            "Non trovo camere attive nella zona scelta. "
-            "Puoi scegliere un'altra zona oppure nessuna preferenza."
-        )
+    camere_struttura = apply_room_filter_for_whatsapp(camere_struttura, session)
 
     disponibili = []
     disponibilita_per_camera_key: Dict[str, bool] = {}
 
     camere_standard = camere_struttura[
-        camere_struttura["tipo_camera"]
-        .astype(str)
-        .str.lower()
-        .str.strip() != "combinata"
+        camere_struttura["tipo_camera"].astype(str).str.lower().str.strip() != "combinata"
     ].copy()
 
     camere_combinate = camere_struttura[
-        camere_struttura["tipo_camera"]
-        .astype(str)
-        .str.lower()
-        .str.strip() == "combinata"
+        camere_struttura["tipo_camera"].astype(str).str.lower().str.strip() == "combinata"
     ].copy()
 
     camere_standard_ok = []
@@ -2282,12 +2096,7 @@ def try_check_whatsapp_availability_for_session(session: dict) -> dict:
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_map = {
-                executor.submit(
-                    check_single_room_availability,
-                    camera,
-                    check_in,
-                    check_out
-                ): camera
+                executor.submit(check_single_room_availability, camera, check_in, check_out): camera
                 for camera in camere_standard_ok
             }
 
@@ -2296,7 +2105,7 @@ def try_check_whatsapp_availability_for_session(session: dict) -> dict:
                 camera_key = str(camera["camera_key"]).strip()
                 nome_camera = str(camera["nome_camera"]).strip()
                 url_camera = str(camera.get("url_airbnb", "")).strip()
-                zona_camera = str(camera.get("zona", session.get("zona_label", ""))).strip()
+                zona_label = str(session.get("zona_label", "")).strip()
 
                 try:
                     _, disponibile = future.result()
@@ -2309,12 +2118,7 @@ def try_check_whatsapp_availability_for_session(session: dict) -> dict:
                     continue
 
                 try:
-                    total_price = get_total_price_from_df(
-                        prezzi,
-                        camera_key,
-                        check_in,
-                        check_out
-                    )
+                    total_price = get_total_price_from_df(prezzi, camera_key, check_in, check_out)
                 except Exception:
                     continue
 
@@ -2323,7 +2127,7 @@ def try_check_whatsapp_availability_for_session(session: dict) -> dict:
                     "camera_key": camera_key,
                     "total_price": total_price,
                     "url_camera": url_camera,
-                    "zona": zona_camera
+                    "zona": zona_label
                 })
 
     for _, camera in camere_combinate.iterrows():
@@ -2331,7 +2135,7 @@ def try_check_whatsapp_availability_for_session(session: dict) -> dict:
         nome_camera = str(camera["nome_camera"]).strip()
         max_ospiti = safe_int(camera["max_ospiti"])
         url_camera = str(camera.get("url_airbnb", "")).strip()
-        zona_camera = str(camera.get("zona", session.get("zona_label", ""))).strip()
+        zona_label = str(session.get("zona_label", "")).strip()
 
         if guests > max_ospiti:
             continue
@@ -2355,12 +2159,7 @@ def try_check_whatsapp_availability_for_session(session: dict) -> dict:
             continue
 
         try:
-            total_price = get_total_price_from_df(
-                prezzi,
-                camera_key,
-                check_in,
-                check_out
-            )
+            total_price = get_total_price_from_df(prezzi, camera_key, check_in, check_out)
         except Exception:
             continue
 
@@ -2369,7 +2168,7 @@ def try_check_whatsapp_availability_for_session(session: dict) -> dict:
             "camera_key": camera_key,
             "total_price": total_price,
             "url_camera": url_camera,
-            "zona": zona_camera
+            "zona": zona_label
         })
 
     if not disponibili:
@@ -2378,10 +2177,7 @@ def try_check_whatsapp_availability_for_session(session: dict) -> dict:
             f"al {session.get('check_out')} per {guests} ospiti."
         )
 
-    disponibili_validi = [
-        camera for camera in disponibili
-        if camera["total_price"] > 0
-    ]
+    disponibili_validi = [camera for camera in disponibili if camera["total_price"] > 0]
 
     if not disponibili_validi:
         return error_response(
@@ -2402,73 +2198,13 @@ def try_check_whatsapp_availability_for_session(session: dict) -> dict:
         "camera_key": migliore["camera_key"],
         "total_price": migliore["total_price"],
         "url_camera": migliore["url_camera"],
-        "zona": migliore.get("zona", session.get("zona_label", ""))
+        "zona": migliore.get("zona", "")
     }
 
 
-def try_check_availability_for_session(session: dict) -> dict:
-    return try_check_whatsapp_availability_for_session(session)
-
-
-def format_euro(value) -> str:
-    try:
-        return f"{float(value):.2f}".replace(".", ",")
-    except Exception:
-        return str(value)
-
-
-def format_date_it(value: str) -> str:
-    try:
-        return datetime.strptime(value, "%Y-%m-%d").strftime("%d/%m/%Y")
-    except Exception:
-        return str(value)
-
-
-def build_regular_availability_reply(session: dict, result: dict) -> str:
+def build_tonight_offer_reply(session: dict, result: dict) -> str:
     session["last_availability"] = result
-    session["last_updated"] = now_utc_iso()
-
-    if not result.get("available"):
-        return (
-            result.get("message", "Non trovo disponibilità con i dati indicati.")
-            + "\n\n"
-            "Vuoi parlare con un operatore?\n"
-            "c) Voglio parlare con un operatore\n\n"
-            "Oppure scrivi 'reset' per ricominciare."
-        )
-
-    url_camera = str(result.get("url_camera", "")).strip()
-    zona = str(result.get("zona") or session.get("zona_label") or "").strip()
-
-    reply = (
-        "Ho trovato questa soluzione disponibile:\n\n"
-        f"Struttura: Janara\n"
-        f"Camera: {result.get('room_name', '')}\n"
-        f"Zona: {zona or 'da verificare'}\n"
-        f"Periodo: {format_date_it(session.get('check_in', ''))} - {format_date_it(session.get('check_out', ''))}\n"
-        f"Ospiti: {session.get('guests', '')}\n"
-        f"Totale soggiorno: € {format_euro(result.get('total_price', 0))}\n"
-    )
-
-    if url_camera:
-        reply += f"\nPuoi vedere foto e dettagli della camera qui:\n{url_camera}\n"
-
-    reply += (
-        "\nPer confermare posso inviarti il riepilogo con il link di pagamento sicuro.\n\n"
-        "Vuoi continuare?\n\n"
-        "a) Sì, voglio ricevere riepilogo e pagamento\n"
-        "b) No\n"
-        "c) Voglio parlare con un operatore"
-    )
-
-    return reply
-
-
-def build_tonight_availability_reply(session: dict, result: dict) -> str:
-    session["last_availability"] = result
-    session["urgent_request"] = True
-    session["urgent_note"] = WHATSAPP_URGENT_NOTE
-    session["last_updated"] = now_utc_iso()
+    session["step"] = "urgent_wait_contact"
 
     if not result.get("available"):
         return (
@@ -2480,33 +2216,182 @@ def build_tonight_availability_reply(session: dict, result: dict) -> str:
         )
 
     url_camera = str(result.get("url_camera", "")).strip()
-    zona = str(result.get("zona") or session.get("zona_label") or "").strip()
+    url_line = f"\n\nPuoi vedere foto e dettagli della camera qui:\n{url_camera}" if url_camera else ""
 
-    reply = (
+    return (
         "Ho trovato una possibile soluzione disponibile per questa sera:\n\n"
         f"Struttura: Janara\n"
         f"Camera: {result.get('room_name', '')}\n"
-        f"Zona: {zona or 'da verificare'}\n"
+        f"Zona: {session.get('zona_label') or result.get('zona') or 'Benevento'}\n"
         f"Periodo: questa sera\n"
-        f"Ospiti: {session.get('guests', '')}\n"
-        f"Totale soggiorno: € {format_euro(result.get('total_price', 0))}\n"
+        f"Ospiti: {session.get('guests')}\n"
+        f"Totale soggiorno: € {format_euro(result.get('total_price', 0))}"
+        f"{url_line}\n\n"
+        "Per preparare il link di pagamento sicuro SumUp, scrivimi:\n\n"
+        "Nome e cognome\n"
+        "Telefono\n\n"
+        "Dopo questi dati ti chiederò la foto del documento di identità, "
+        "che sarà salvata in modo riservato e verificata da un operatore."
     )
 
-    if url_camera:
-        reply += f"\nPuoi vedere foto e dettagli della camera qui:\n{url_camera}\n"
 
-    reply += (
-        "\nEssendo una richiesta per questa sera, ti consigliamo di confermare "
-        "direttamente con un operatore.\n\n"
-        f"Puoi chiamarci ora al numero:\n{WHATSAPP_OPERATOR_PHONE}\n\n"
-        "Ho registrato la tua richiesta come urgente."
+def build_normal_offer_reply(session: dict, result: dict) -> str:
+    session["last_availability"] = result
+    session["step"] = "post_availability_choice"
+
+    if not result.get("available"):
+        return result.get("message", "Non risultano disponibilità per i dati indicati.")
+
+    url_camera = str(result.get("url_camera", "")).strip()
+    url_line = f"\n\nPuoi vedere foto e dettagli della camera qui:\n{url_camera}" if url_camera else ""
+
+    return (
+        "Ho trovato questa soluzione disponibile:\n\n"
+        f"Struttura: Janara\n"
+        f"Camera: {result.get('room_name', '')}\n"
+        f"Zona: {session.get('zona_label') or result.get('zona') or 'Benevento'}\n"
+        f"Periodo: {session.get('check_in')} - {session.get('check_out')}\n"
+        f"Ospiti: {session.get('guests')}\n"
+        f"Totale soggiorno: € {format_euro(result.get('total_price', 0))}"
+        f"{url_line}\n\n"
+        "Vuoi ricevere il riepilogo con il link di pagamento?\n\n"
+        "a) Sì, voglio ricevere riepilogo e pagamento\n"
+        "b) No\n"
+        "c) Voglio parlare con un operatore"
     )
 
-    return reply
+
+def save_whatsapp_document_to_drive(
+    from_number: str,
+    media_url: str,
+    media_content_type: str = ""
+) -> Tuple[bool, str, str]:
+    if not media_url:
+        return False, "", "MediaUrl mancante."
+
+    try:
+        auth = None
+
+        if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+            auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+        response = http.get(
+            media_url,
+            auth=auth,
+            timeout=REQUEST_TIMEOUT_SECONDS
+        )
+        response.raise_for_status()
+
+        content_type = media_content_type or response.headers.get("Content-Type", "application/octet-stream")
+
+        extension = ".jpg"
+
+        if "png" in content_type:
+            extension = ".png"
+        elif "pdf" in content_type:
+            extension = ".pdf"
+        elif "jpeg" in content_type or "jpg" in content_type:
+            extension = ".jpg"
+
+        clean_number = re.sub(r"[^0-9]+", "", str(from_number))
+        filename = f"documento_whatsapp_{clean_number}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}{extension}"
+
+        file_metadata = {
+            "name": filename,
+            "parents": [WHATSAPP_DOCUMENTS_FOLDER_ID]
+        }
+
+        media = MediaIoBaseUpload(
+            io.BytesIO(response.content),
+            mimetype=content_type,
+            resumable=False
+        )
+
+        service = get_drive_service()
+
+        created_file = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id, webViewLink"
+        ).execute()
+
+        file_id = created_file.get("id", "")
+        web_view_link = created_file.get("webViewLink", "")
+
+        if not web_view_link and file_id:
+            web_view_link = f"https://drive.google.com/file/d/{file_id}/view"
+
+        return True, web_view_link, ""
+
+    except Exception as e:
+        return False, "", str(e)
 
 
-def build_availability_reply(session: dict, result: dict) -> str:
-    return build_regular_availability_reply(session, result)
+def create_urgent_sumup_and_reply(session: dict) -> str:
+    result = session.get("last_availability") or {}
+
+    if not result.get("available"):
+        return build_operator_reply()
+
+    nome = str(session.get("contact_name", "")).strip()
+    telefono = str(session.get("contact_phone", "")).strip()
+    email = str(session.get("contact_email", "")).strip()
+
+    if not nome or not telefono:
+        session["step"] = "urgent_wait_contact"
+        return (
+            "Per preparare il link di pagamento SumUp mi servono prima:\n\n"
+            "Nome e cognome\n"
+            "Telefono"
+        )
+
+    payment_link = ""
+    checkout_error = ""
+
+    try:
+        checkout_result = create_sumup_checkout_link(
+            SumupCheckoutRequest(
+                nome=nome,
+                email=email or "",
+                telefono=telefono,
+                struttura=str(session.get("structure", "Benevento")),
+                camera=str(result.get("room_name", "")),
+                camera_key=str(result.get("camera_key", "")),
+                check_in=str(session.get("check_in", "")),
+                check_out=str(session.get("check_out", "")),
+                ospiti=int(session.get("guests", 0)),
+                totale=float(result.get("total_price", 0))
+            )
+        )
+
+        if checkout_result.get("success"):
+            payment_link = str(checkout_result.get("payment_link", "")).strip()
+        else:
+            checkout_error = str(checkout_result.get("message", "Errore creazione link SumUp."))
+
+    except Exception as e:
+        checkout_error = str(e)
+
+    session["step"] = "completed"
+
+    if payment_link:
+        return (
+            f"Perfetto {nome}, abbiamo ricevuto il documento e preparato il link "
+            "di pagamento sicuro SumUp per confermare la prenotazione:\n\n"
+            f"{payment_link}\n\n"
+            "Il documento sarà verificato da un operatore.\n\n"
+            "Essendo una richiesta per questa sera, dopo il pagamento ti consigliamo "
+            "comunque di confermare direttamente con un operatore.\n\n"
+            f"Puoi chiamarci o scriverci al numero:\n{WHATSAPP_OPERATOR_PHONE}\n\n"
+            "Ho registrato la tua richiesta come urgente."
+        )
+
+    return (
+        f"Grazie {nome}, abbiamo ricevuto il documento ma non sono riuscito a generare "
+        f"il link SumUp in automatico. Dettaglio tecnico: {checkout_error}\n\n"
+        "La richiesta resta registrata come urgente.\n\n"
+        f"Puoi chiamarci o scriverci al numero:\n{WHATSAPP_OPERATOR_PHONE}"
+    )
 
 
 def try_send_booking_summary_from_whatsapp(session: dict, contact: dict) -> str:
@@ -2515,7 +2400,7 @@ def try_send_booking_summary_from_whatsapp(session: dict, contact: dict) -> str:
     if not result.get("available"):
         return (
             "Prima devo controllare una disponibilità valida. "
-            "Scrivi 'reset' per ricominciare oppure scegli un'altra data."
+            "Indicami struttura, date e numero di ospiti."
         )
 
     nome = contact.get("nome", "").strip()
@@ -2537,8 +2422,7 @@ def try_send_booking_summary_from_whatsapp(session: dict, contact: dict) -> str:
         return (
             "Per inviarti il riepilogo mi manca: "
             + ", ".join(missing)
-            + ".\n\n"
-            "Puoi scriverli in un unico messaggio?"
+            + ". Puoi scriverli in un unico messaggio?"
         )
 
     payment_link = ""
@@ -2549,7 +2433,7 @@ def try_send_booking_summary_from_whatsapp(session: dict, contact: dict) -> str:
                 nome=nome,
                 email=email,
                 telefono=telefono,
-                struttura=str(session.get("structure", WHATSAPP_DEFAULT_STRUCTURE)),
+                struttura=str(session.get("structure", "")),
                 camera=str(result.get("room_name", "")),
                 camera_key=str(result.get("camera_key", "")),
                 check_in=str(session.get("check_in", "")),
@@ -2571,7 +2455,7 @@ def try_send_booking_summary_from_whatsapp(session: dict, contact: dict) -> str:
                 nome=nome,
                 email=email,
                 telefono=telefono,
-                struttura=str(session.get("structure", WHATSAPP_DEFAULT_STRUCTURE)),
+                struttura=str(session.get("structure", "")),
                 camera=str(result.get("room_name", "")),
                 check_in=str(session.get("check_in", "")),
                 check_out=str(session.get("check_out", "")),
@@ -2583,29 +2467,20 @@ def try_send_booking_summary_from_whatsapp(session: dict, contact: dict) -> str:
         )
 
         if email_result.get("success"):
-            reply = (
-                f"Perfetto {nome}, ti ho inviato il riepilogo della prenotazione a:\n"
-                f"{email}\n\n"
-                "Nel riepilogo trovi:\n"
-                "- dati del soggiorno\n"
-                "- foto e dettagli della camera\n"
-                "- totale soggiorno\n"
-                "- link di pagamento sicuro\n"
-            )
+            session["step"] = "completed"
+            reply = f"Perfetto {nome}, ti ho inviato il riepilogo a {email}."
 
             if payment_link:
-                reply += f"\nPuoi confermare anche da questo link:\n{payment_link}\n"
+                reply += f"\n\nPuoi confermare anche da questo link SumUp:\n{payment_link}"
             else:
-                reply += "\nNell'email trovi anche le istruzioni per il pagamento.\n"
+                reply += "\n\nNell'email trovi anche le istruzioni per il pagamento."
 
             reply += (
-                "\nPrima di procedere, se vuoi verificare che sia tutto corretto "
+                "\n\nPrima di procedere, se vuoi verificare che sia tutto corretto "
                 "o parlare con noi, puoi chiamare o scrivere al numero:\n"
                 f"{WHATSAPP_OPERATOR_PHONE}"
             )
 
-            session["step"] = "completed"
-            session["last_updated"] = now_utc_iso()
             return reply
 
         return (
@@ -2626,7 +2501,7 @@ def get_fallback_ai_reply(message: str, session: dict) -> str:
             "Sei l'assistente WhatsApp di Janara Hospitality. "
             "Rispondi in italiano, in modo breve e cortese. "
             "Non inventare disponibilità o prezzi. "
-            "Invita il cliente a seguire il percorso guidato se mancano dati. "
+            "Se mancano dati, accompagna il cliente nel percorso guidato. "
             f"Stato conversazione: {session}. "
             f"Messaggio cliente: {message}"
         )
@@ -2655,32 +2530,54 @@ def get_fallback_ai_reply(message: str, session: dict) -> str:
         return ""
 
 
-def handle_whatsapp_message(from_number: str, incoming_message: str) -> str:
+def handle_whatsapp_message(
+    from_number: str,
+    incoming_message: str,
+    media_url: str = "",
+    media_content_type: str = ""
+) -> str:
     message = str(incoming_message or "").strip()
-    message_l = clean_whatsapp_choice(message)
+    message_l = message.lower().strip()
 
-    if not message:
-        session = get_whatsapp_session(from_number)
-        session["step"] = "ask_guests"
+    if message_l in ["reset", "ricomincia", "annulla"]:
+        reset_whatsapp_session(from_number)
         return build_guests_menu()
 
-    if message_l in ["reset", "ricomincia", "annulla", "riparti"]:
-        reset_whatsapp_session(from_number)
-        session = get_whatsapp_session(from_number)
-        session["step"] = "ask_guests"
+    session = get_whatsapp_session(from_number)
+    session["last_updated"] = datetime.utcnow().isoformat()
+
+    if media_url:
+        if session.get("step") == "urgent_wait_document":
+            ok, document_link, error = save_whatsapp_document_to_drive(
+                from_number=from_number,
+                media_url=media_url,
+                media_content_type=media_content_type
+            )
+
+            if ok:
+                session["document_link"] = document_link
+                session["document_status"] = "DOCUMENTO RICEVUTO - DA VERIFICARE"
+                session["urgent_note"] = "RICHIESTA URGENTE - QUESTA SERA"
+                return create_urgent_sumup_and_reply(session)
+
+            return (
+                "Ho ricevuto il file, ma non sono riuscito a salvarlo correttamente "
+                f"su Google Drive. Errore: {error}\n\n"
+                f"Puoi chiamarci o scriverci al numero:\n{WHATSAPP_OPERATOR_PHONE}"
+            )
+
         return (
-            "Va bene, ricominciamo da capo.\n\n"
+            "Ho ricevuto un allegato. Per completare la procedura, segui prima "
+            "le domande guidate.\n\n"
             + build_guests_menu()
         )
 
-    session = get_whatsapp_session(from_number)
+    if not message:
+        return build_guests_menu()
 
-    # Se il cliente invia direttamente contatti dopo una disponibilità, invia il riepilogo.
-    contact = extract_contact_data(message)
-    has_contact_data = bool(contact.get("email") or contact.get("telefono"))
-
-    if has_contact_data and session.get("last_availability"):
-        return try_send_booking_summary_from_whatsapp(session, contact)
+    if is_operator_intent(message):
+        session["urgent_note"] = "RICHIESTA OPERATORE"
+        return build_operator_reply()
 
     step = session.get("step", "ask_guests")
 
@@ -2689,81 +2586,81 @@ def handle_whatsapp_message(from_number: str, incoming_message: str) -> str:
 
         if guests <= 0:
             return (
-                "Non sono riuscito a capire il numero di persone.\n\n"
+                "Non ho capito il numero di persone.\n\n"
                 + build_guests_menu()
             )
 
         session["guests"] = guests
+
+        if guests > 4:
+            session["urgent_note"] = "RICHIESTA OPERATORE - PIU DI 4 OSPITI"
+            return (
+                "Per più di 4 persone preferiamo verificare direttamente la soluzione migliore.\n\n"
+                f"Puoi chiamarci o scriverci al numero:\n{WHATSAPP_OPERATOR_PHONE}"
+            )
+
         session["step"] = "ask_zone"
-        session["last_updated"] = now_utc_iso()
         return build_zone_menu()
 
     if step == "ask_zone":
-        zona, zona_label = parse_zone_choice(message)
+        zone_key, zone_label, allowed_keywords = parse_zone_choice(message)
 
-        if not zona_label:
+        if not zone_key:
             return (
-                "Non sono riuscito a capire la zona scelta.\n\n"
+                "Non ho capito la zona scelta.\n\n"
                 + build_zone_menu()
             )
 
-        session["zona"] = zona
-        session["zona_label"] = zona_label
-        session["step"] = "ask_date_type"
-        session["last_updated"] = now_utc_iso()
-        return build_date_type_menu()
+        session["zona"] = zone_key
+        session["zona_label"] = zone_label
+        session["allowed_camera_keywords"] = allowed_keywords
+        session["step"] = "ask_date_choice"
 
-    if step == "ask_date_type":
-        date_choice = parse_date_type_choice(message)
+        return build_date_choice_menu()
 
-        if date_choice == "tonight":
+    if step == "ask_date_choice":
+        if message_l in ["a", "questa sera", "stasera", "1"]:
             today = date.today()
-            session["date_choice"] = "tonight"
             session["check_in"] = today.isoformat()
             session["check_out"] = (today + timedelta(days=1)).isoformat()
             session["urgent_request"] = True
-            session["urgent_note"] = WHATSAPP_URGENT_NOTE
-            session["step"] = "completed_urgent"
-            session["last_updated"] = now_utc_iso()
+            session["urgent_note"] = "RICHIESTA URGENTE - QUESTA SERA"
 
-            result = try_check_whatsapp_availability_for_session(session)
-            return build_tonight_availability_reply(session, result)
+            result = check_whatsapp_availability_for_session(session)
+            return build_tonight_offer_reply(session, result)
 
-        if date_choice == "other":
-            session["date_choice"] = "other"
-            session["step"] = "ask_dates"
-            session["last_updated"] = now_utc_iso()
-            return build_ask_dates_message()
+        if message_l in ["b", "altra data", "2"]:
+            session["step"] = "ask_dates_text"
+            return (
+                "Va bene. Scrivi le date del soggiorno.\n\n"
+                "Esempio:\n"
+                "dal 20 al 22 giugno 2026"
+            )
 
         return (
-            "Non sono riuscito a capire la scelta.\n\n"
-            + build_date_type_menu()
+            "Non ho capito la scelta.\n\n"
+            + build_date_choice_menu()
         )
 
-    if step == "ask_dates":
+    if step == "ask_dates_text":
         check_in, check_out = extract_dates_from_message(message)
 
         if not check_in or not check_out:
             return (
-                "Non sono riuscito a leggere bene le date.\n\n"
+                "Non ho capito le date.\n\n"
                 "Scrivile così, ad esempio:\n"
                 "dal 20 al 22 giugno 2026"
             )
 
         session["check_in"] = check_in
         session["check_out"] = check_out
-        session["step"] = "after_availability"
-        session["last_updated"] = now_utc_iso()
 
-        result = try_check_whatsapp_availability_for_session(session)
-        return build_regular_availability_reply(session, result)
+        result = check_whatsapp_availability_for_session(session)
+        return build_normal_offer_reply(session, result)
 
-    if step == "after_availability":
-        choice = parse_after_availability_choice(message)
-
-        if choice == "summary":
-            session["step"] = "collect_contact"
-            session["last_updated"] = now_utc_iso()
+    if step == "post_availability_choice":
+        if is_confirmation_intent(message):
+            session["step"] = "wait_booking_contact"
             return (
                 "Perfetto. Per preparare il riepilogo della prenotazione, scrivimi:\n\n"
                 "Nome e cognome\n"
@@ -2771,73 +2668,87 @@ def handle_whatsapp_message(from_number: str, incoming_message: str) -> str:
                 "Telefono"
             )
 
-        if choice == "stop":
+        if message_l in ["b", "no", "2"]:
             session["step"] = "completed"
-            session["last_updated"] = now_utc_iso()
             return (
                 "Va bene. Se vuoi, puoi scrivermi di nuovo per controllare altre date "
-                "o altre zone.\n\n"
-                "Per ricominciare scrivi: reset"
+                "o altre zone."
             )
 
-        if choice == "operator":
-            session["step"] = "completed_operator"
-            session["urgent_note"] = WHATSAPP_OPERATOR_NOTE
-            session["last_updated"] = now_utc_iso()
-            return build_operator_message(session)
-
-        if has_contact_data:
-            return try_send_booking_summary_from_whatsapp(session, contact)
+        if is_operator_intent(message):
+            session["urgent_note"] = "RICHIESTA OPERATORE"
+            return build_operator_reply()
 
         return (
-            "Scegli una delle opzioni:\n\n"
+            "Non ho capito la scelta.\n\n"
             "a) Sì, voglio ricevere riepilogo e pagamento\n"
             "b) No\n"
             "c) Voglio parlare con un operatore"
         )
 
-    if step == "collect_contact":
+    if step == "wait_booking_contact":
+        contact = extract_contact_data(message)
         return try_send_booking_summary_from_whatsapp(session, contact)
 
-    if step in ["completed", "completed_urgent", "completed_operator"]:
-        if message_l in ["ciao", "salve", "buongiorno", "buonasera", "nuova richiesta", "prenotazione"]:
-            reset_whatsapp_session(from_number)
-            session = get_whatsapp_session(from_number)
-            return build_guests_menu()
+    if step == "urgent_wait_contact":
+        contact = extract_contact_data(message)
 
-        if is_confirmation_intent(message) and session.get("last_availability") and not session.get("urgent_request"):
-            session["step"] = "collect_contact"
+        nome = contact.get("nome", "").strip()
+        telefono = contact.get("telefono", "").strip()
+        email = contact.get("email", "").strip()
+
+        missing = []
+
+        if not nome:
+            missing.append("nome e cognome")
+
+        if not telefono:
+            missing.append("telefono")
+
+        if missing:
             return (
-                "Perfetto. Per preparare il riepilogo della prenotazione, scrivimi:\n\n"
-                "Nome e cognome\n"
-                "Email\n"
-                "Telefono"
+                "Per preparare il link di pagamento SumUp mi manca: "
+                + ", ".join(missing)
+                + ".\n\nPuoi scriverli in un unico messaggio?"
             )
 
+        session["contact_name"] = nome
+        session["contact_phone"] = telefono
+        session["contact_email"] = email
+        session["step"] = "urgent_wait_document"
+
         return (
-            "Per una nuova richiesta scrivi: reset\n\n"
-            f"Per parlare con noi puoi chiamare o scrivere al numero:\n{WHATSAPP_OPERATOR_PHONE}"
+            f"Grazie {nome}.\n\n"
+            "Ora invia qui su WhatsApp una foto leggibile del documento di identità.\n\n"
+            "La foto sarà salvata nella cartella riservata Google Drive della struttura "
+            "e sarà usata solo per la verifica della richiesta e per gli adempimenti "
+            "previsti per la struttura ricettiva.\n\n"
+            "Dopo la ricezione del documento ti invierò il link di pagamento sicuro SumUp."
         )
 
-    # Compatibilità con messaggi liberi non perfettamente allineati al flusso.
-    update_session_from_message(session, message)
+    if step == "urgent_wait_document":
+        return (
+            "Per proseguire devi inviare una foto leggibile del documento di identità "
+            "come allegato WhatsApp.\n\n"
+            f"Per assistenza puoi chiamare o scrivere al numero:\n{WHATSAPP_OPERATOR_PHONE}"
+        )
 
-    missing_question = build_missing_fields_question(session)
+    if step == "completed":
+        if message_l in ["ciao", "buongiorno", "salve", "menu", "inizia"]:
+            reset_whatsapp_session(from_number)
+            return build_guests_menu()
 
-    if missing_question:
-        return missing_question
+        return (
+            "La richiesta è già stata gestita. Se vuoi iniziare una nuova ricerca, "
+            "scrivi: reset"
+        )
 
-    try:
-        result = try_check_whatsapp_availability_for_session(session)
-        session["step"] = "after_availability"
-        return build_regular_availability_reply(session, result)
-    except Exception as e:
-        ai_reply = get_fallback_ai_reply(message, session)
+    ai_reply = get_fallback_ai_reply(message, session)
 
-        if ai_reply:
-            return ai_reply
+    if ai_reply:
+        return ai_reply
 
-        return f"Mi dispiace, ho avuto un problema nel controllo disponibilità: {str(e)}"
+    return build_guests_menu()
 
 
 # =========================
@@ -2852,7 +2763,7 @@ def whatsapp_webhook_test():
         "endpoint": "/whatsapp-webhook",
         "openai_configured": bool(OPENAI_API_KEY),
         "openai_available": bool(_openai_client),
-        "operator_phone": WHATSAPP_OPERATOR_PHONE
+        "documents_folder_id": WHATSAPP_DOCUMENTS_FOLDER_ID
     }
 
 
@@ -2864,6 +2775,9 @@ async def whatsapp_webhook(request: Request):
     Twilio invia normalmente i dati come application/x-www-form-urlencoded:
     - Body: testo del messaggio ricevuto
     - From: numero WhatsApp del cliente
+    - NumMedia: numero allegati/foto/documenti
+    - MediaUrl0: URL temporaneo primo allegato
+    - MediaContentType0: tipo file del primo allegato
 
     La risposta viene restituita in formato TwiML XML.
     """
@@ -2875,27 +2789,43 @@ async def whatsapp_webhook(request: Request):
         incoming_message = str(parsed_body.get("Body", [""])[0]).strip()
         from_number = str(parsed_body.get("From", [""])[0]).strip()
 
-        print(f"Messaggio WhatsApp ricevuto da {from_number}: {incoming_message}")
+        num_media = safe_int(str(parsed_body.get("NumMedia", ["0"])[0]), 0)
+        media_url = ""
+        media_content_type = ""
+
+        if num_media > 0:
+            media_url = str(parsed_body.get("MediaUrl0", [""])[0]).strip()
+            media_content_type = str(parsed_body.get("MediaContentType0", [""])[0]).strip()
+
+        print(
+            f"Messaggio WhatsApp ricevuto da {from_number}: {incoming_message} "
+            f"- media: {num_media}"
+        )
 
         reply = handle_whatsapp_message(
             from_number=from_number,
-            incoming_message=incoming_message
+            incoming_message=incoming_message,
+            media_url=media_url,
+            media_content_type=media_content_type
         )
 
         try:
             session = WHATSAPP_SESSIONS.get(from_number, {})
 
+            status = session.get("document_status") or session.get("urgent_note") or "OK"
+
             append_whatsapp_chat_log([
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 from_number,
-                incoming_message,
+                incoming_message if incoming_message else "[ALLEGATO]",
                 reply,
                 session.get("structure", ""),
-                session.get("zona_label", ""),
                 session.get("check_in", ""),
                 session.get("check_out", ""),
                 session.get("guests", ""),
-                session.get("urgent_note", "") or ("OK" if not session.get("urgent_request") else WHATSAPP_URGENT_NOTE)
+                status,
+                session.get("zona_label", ""),
+                session.get("document_link", "")
             ])
 
         except Exception as log_error:
