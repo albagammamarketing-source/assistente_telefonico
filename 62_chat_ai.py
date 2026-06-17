@@ -3,6 +3,7 @@ import os
 import time
 import uuid
 import re
+import base64
 from xml.sax.saxutils import escape
 from urllib.parse import parse_qs
 from datetime import datetime, date, timedelta
@@ -65,7 +66,14 @@ WHATSAPP_OPERATOR_PHONE = os.environ.get(
     "+39 375 562 6515"
 )
 
-# Cartella Google Drive dove salvare le foto dei documenti ricevuti via WhatsApp.
+# Email operativa dove inviare le foto dei documenti ricevuti via WhatsApp.
+# Questa soluzione evita il problema quota Drive delle service account su Google Drive personale.
+WHATSAPP_DOCUMENT_EMAIL = os.environ.get(
+    "WHATSAPP_DOCUMENT_EMAIL",
+    "infojanara@gmail.com"
+)
+
+# Cartella Google Drive mantenuta solo come compatibilità, ma non usata nel flusso attuale.
 WHATSAPP_DOCUMENTS_FOLDER_ID = os.environ.get(
     "WHATSAPP_DOCUMENTS_FOLDER_ID",
     "1j68I_QeTgvbYlWn4POAU-6FpQ1WcFm1b"
@@ -1016,7 +1024,8 @@ def health():
         "sumup_redirect_url": SUMUP_REDIRECT_URL,
         "google_credentials_path": GOOGLE_APPLICATION_CREDENTIALS,
         "internal_notification_email": INTERNAL_NOTIFICATION_EMAIL,
-        "prenotazioni_sheet_name": PRENOTAZIONI_SHEET_NAME
+        "prenotazioni_sheet_name": PRENOTAZIONI_SHEET_NAME,
+        "whatsapp_document_email": WHATSAPP_DOCUMENT_EMAIL
     }
 
 
@@ -2261,13 +2270,27 @@ def build_normal_offer_reply(session: dict, result: dict) -> str:
     )
 
 
-def save_whatsapp_document_to_drive(
+def send_whatsapp_document_to_operator_email(
     from_number: str,
     media_url: str,
-    media_content_type: str = ""
+    media_content_type: str = "",
+    session: Optional[dict] = None
 ) -> Tuple[bool, str, str]:
+    """
+    Scarica il documento ricevuto da WhatsApp/Twilio e lo invia via email
+    all'indirizzo operativo della struttura.
+
+    Non salva il file su Google Drive, così evitiamo il problema:
+    "Service Accounts do not have storage quota".
+    """
     if not media_url:
         return False, "", "MediaUrl mancante."
+
+    if not RESEND_API_KEY:
+        return False, "", "RESEND_API_KEY non configurata."
+
+    if not WHATSAPP_DOCUMENT_EMAIL:
+        return False, "", "WHATSAPP_DOCUMENT_EMAIL non configurata."
 
     try:
         auth = None
@@ -2282,7 +2305,10 @@ def save_whatsapp_document_to_drive(
         )
         response.raise_for_status()
 
-        content_type = media_content_type or response.headers.get("Content-Type", "application/octet-stream")
+        content_type = media_content_type or response.headers.get(
+            "Content-Type",
+            "application/octet-stream"
+        )
 
         extension = ".jpg"
 
@@ -2292,36 +2318,77 @@ def save_whatsapp_document_to_drive(
             extension = ".pdf"
         elif "jpeg" in content_type or "jpg" in content_type:
             extension = ".jpg"
+        elif "heic" in content_type:
+            extension = ".heic"
 
         clean_number = re.sub(r"[^0-9]+", "", str(from_number))
-        filename = f"documento_whatsapp_{clean_number}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}{extension}"
-
-        file_metadata = {
-            "name": filename,
-            "parents": [WHATSAPP_DOCUMENTS_FOLDER_ID]
-        }
-
-        media = MediaIoBaseUpload(
-            io.BytesIO(response.content),
-            mimetype=content_type,
-            resumable=False
+        filename = (
+            f"documento_whatsapp_{clean_number}_"
+            f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}{extension}"
         )
 
-        service = get_drive_service()
+        encoded_content = base64.b64encode(response.content).decode("utf-8")
 
-        created_file = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields="id, webViewLink"
-        ).execute()
+        session = session or {}
+        nome = str(session.get("contact_name", "")).strip()
+        telefono = str(session.get("contact_phone", "")).strip()
+        email_cliente = str(session.get("contact_email", "")).strip()
+        camera = ""
+        totale = ""
 
-        file_id = created_file.get("id", "")
-        web_view_link = created_file.get("webViewLink", "")
+        result = session.get("last_availability") or {}
+        if isinstance(result, dict):
+            camera = str(result.get("room_name", "")).strip()
+            totale = str(result.get("total_price", "")).strip()
 
-        if not web_view_link and file_id:
-            web_view_link = f"https://drive.google.com/file/d/{file_id}/view"
+        html = f"""
+        <h2>Documento ricevuto da WhatsApp</h2>
 
-        return True, web_view_link, ""
+        <p>
+        È stato ricevuto un documento da verificare per una richiesta Janara.
+        Il file è allegato a questa email.
+        </p>
+
+        <hr>
+
+        <h3>Dati cliente</h3>
+        <p><b>Numero WhatsApp:</b> {from_number}</p>
+        <p><b>Nome:</b> {nome}</p>
+        <p><b>Telefono:</b> {telefono}</p>
+        <p><b>Email:</b> {email_cliente}</p>
+
+        <hr>
+
+        <h3>Dati soggiorno</h3>
+        <p><b>Struttura:</b> {session.get('structure', '')}</p>
+        <p><b>Zona:</b> {session.get('zona_label', '')}</p>
+        <p><b>Camera:</b> {camera}</p>
+        <p><b>Check-in:</b> {session.get('check_in', '')}</p>
+        <p><b>Check-out:</b> {session.get('check_out', '')}</p>
+        <p><b>Ospiti:</b> {session.get('guests', '')}</p>
+        <p><b>Totale:</b> € {totale}</p>
+
+        <hr>
+
+        <p><b>Stato:</b> DOCUMENTO RICEVUTO - INVIATO VIA EMAIL - DA VERIFICARE</p>
+        <p>Verificare il documento manualmente prima di confermare definitivamente la prenotazione.</p>
+        """
+
+        resend_response = resend.Emails.send({
+            "from": RESEND_FROM,
+            "to": [WHATSAPP_DOCUMENT_EMAIL],
+            "subject": f"Documento WhatsApp Janara - {nome or clean_number}",
+            "html": html,
+            "attachments": [
+                {
+                    "filename": filename,
+                    "content": encoded_content
+                }
+            ]
+        })
+
+        print(resend_response)
+        return True, f"INVIATO VIA EMAIL: {WHATSAPP_DOCUMENT_EMAIL}", ""
 
     except Exception as e:
         return False, "", str(e)
@@ -2548,15 +2615,16 @@ def handle_whatsapp_message(
 
     if media_url:
         if session.get("step") == "urgent_wait_document":
-            ok, document_link, error = save_whatsapp_document_to_drive(
+            ok, document_marker, error = send_whatsapp_document_to_operator_email(
                 from_number=from_number,
                 media_url=media_url,
-                media_content_type=media_content_type
+                media_content_type=media_content_type,
+                session=session
             )
 
             if ok:
-                session["document_link"] = document_link
-                session["document_status"] = "DOCUMENTO RICEVUTO - DA VERIFICARE"
+                session["document_link"] = document_marker
+                session["document_status"] = "DOCUMENTO RICEVUTO - INVIATO VIA EMAIL - DA VERIFICARE"
                 session["urgent_note"] = "RICHIESTA URGENTE - QUESTA SERA"
                 return create_urgent_sumup_and_reply(session)
 
@@ -2720,7 +2788,7 @@ def handle_whatsapp_message(
         return (
             f"Grazie {nome}.\n\n"
             "Ora invia qui su WhatsApp una foto leggibile del documento di identità.\n\n"
-            "La foto sarà salvata nella cartella riservata Google Drive della struttura "
+            "La foto sarà inviata in modo riservato all'email della struttura "
             "e sarà usata solo per la verifica della richiesta e per gli adempimenti "
             "previsti per la struttura ricettiva.\n\n"
             "Dopo la ricezione del documento ti invierò il link di pagamento sicuro SumUp."
@@ -2763,7 +2831,8 @@ def whatsapp_webhook_test():
         "endpoint": "/whatsapp-webhook",
         "openai_configured": bool(OPENAI_API_KEY),
         "openai_available": bool(_openai_client),
-        "documents_folder_id": WHATSAPP_DOCUMENTS_FOLDER_ID
+        "document_email": WHATSAPP_DOCUMENT_EMAIL,
+        "documents_folder_id_compatibility": WHATSAPP_DOCUMENTS_FOLDER_ID
     }
 
 
