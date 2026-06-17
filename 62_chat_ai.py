@@ -1678,24 +1678,31 @@ ITALIAN_MONTHS = {
 }
 
 
-ZONE_STRUCTURE_MAP = {
-    # Il cliente sceglie la zona; il sistema filtra prima la struttura corretta
-    # e poi controlla le camere disponibili dentro quella struttura.
+ZONE_CAMERA_MAP = {
     "via_annunziata": {
-        "label": "Via Annunziata / Centro storico",
-        "structure": "janara_santa_sofia"
+        "label": "Via Annunziata (Centro storico)",
+        "allowed_camera_keywords": [
+            "santa sofia",
+            "rocca dei rettori",
+            "arechi",
+            "iside",
+            "orsini",
+            "arco di traiano"
+        ]
     },
     "triggio": {
-        "label": "Triggio",
-        "structure": "janara_teatro_romano"
-    },
-    "centro": {
-        "label": "Nei pressi del centro",
-        "structure": "Benevento"
+        "label": "Quartiere Triggio (nei pressi del Teatro Romano)",
+        "allowed_camera_keywords": [
+            "teatro romano",
+            "duomo",
+            "port arsa",
+            "port’arsa",
+            "mura longobarde"
+        ]
     },
     "nessuna_preferenza": {
         "label": "Nessuna preferenza",
-        "structure": "Benevento"
+        "allowed_camera_keywords": []
     }
 }
 
@@ -1734,11 +1741,11 @@ def get_whatsapp_session(from_number: str) -> dict:
             "structure": "Benevento",
             "zona": "",
             "zona_label": "",
+            "allowed_camera_keywords": [],
             "check_in": "",
             "check_out": "",
             "guests": 0,
             "last_availability": None,
-            "available_rooms": [],
             "urgent_request": False,
             "urgent_note": "",
             "contact_name": "",
@@ -1934,7 +1941,10 @@ def is_confirmation_intent(text: str) -> bool:
 def is_operator_intent(text: str) -> bool:
     text_l = str(text or "").lower().strip()
 
-    return text_l in ["c", "operatore", "parlare con operatore", "voglio parlare con un operatore"] or "operatore" in text_l
+    return (
+        text_l in ["operatore", "parlare con operatore", "voglio parlare con un operatore"]
+        or "operatore" in text_l
+    )
 
 
 def build_guests_menu() -> str:
@@ -1954,10 +1964,9 @@ def build_zone_menu() -> str:
     return (
         "Perfetto.\n\n"
         "2. In quale zona preferite soggiornare?\n\n"
-        "a) Via Annunziata / Centro storico\n"
-        "b) Triggio\n"
-        "c) Nei pressi del centro\n"
-        "d) Nessuna preferenza"
+        "a) Via Annunziata (Centro storico)\n"
+        "b) Quartiere Triggio (nei pressi del Teatro Romano)\n"
+        "c) Nessuna preferenza"
     )
 
 
@@ -1978,33 +1987,51 @@ def build_operator_reply() -> str:
     )
 
 
-def parse_zone_choice(message: str) -> Tuple[str, str, str]:
+def parse_zone_choice(message: str) -> Tuple[str, str, List[str]]:
     text_l = str(message or "").lower().strip()
 
     if text_l in ["a", "1", "via annunziata", "annunziata", "centro storico"]:
         zone_key = "via_annunziata"
-    elif text_l in ["b", "2", "triggio"]:
+    elif text_l in ["b", "2", "triggio", "quartiere triggio", "teatro romano"]:
         zone_key = "triggio"
-    elif text_l in ["c", "3", "centro", "nei pressi del centro", "pressi del centro"]:
-        zone_key = "centro"
-    elif text_l in ["d", "4", "nessuna preferenza", "indifferente", "non ho preferenze"]:
+    elif text_l in ["c", "3", "nessuna preferenza", "indifferente", "non ho preferenze", "nessuna"]:
         zone_key = "nessuna_preferenza"
     else:
-        return "", "", ""
+        return "", "", []
 
-    zone_data = ZONE_STRUCTURE_MAP[zone_key]
-    return zone_key, zone_data["label"], zone_data["structure"]
+    zone_data = ZONE_CAMERA_MAP[zone_key]
+    return zone_key, zone_data["label"], zone_data["allowed_camera_keywords"]
+
+
+def apply_room_filter_for_whatsapp(camere: pd.DataFrame, session: dict) -> pd.DataFrame:
+    allowed_keywords = session.get("allowed_camera_keywords") or []
+
+    if not allowed_keywords:
+        return camere
+
+    allowed_norm = [normalize_for_match(k) for k in allowed_keywords]
+
+    def row_matches(row) -> bool:
+        nome_camera = normalize_for_match(row.get("nome_camera", ""))
+        camera_key = normalize_for_match(row.get("camera_key", ""))
+
+        return any(
+            keyword in nome_camera or keyword in camera_key
+            for keyword in allowed_norm
+        )
+
+    filtered = camere[camere.apply(row_matches, axis=1)].copy()
+
+    # Sicurezza: se i nomi sul foglio sono diversi e non troviamo nulla,
+    # non blocchiamo il sistema. Proviamo comunque sul set completo.
+    if filtered.empty:
+        print("Filtro zona WhatsApp non ha trovato camere. Uso camere complete.")
+        return camere
+
+    return filtered
 
 
 def check_whatsapp_availability_for_session(session: dict) -> dict:
-    """
-    Controllo disponibilità dedicato a WhatsApp.
-
-    Logica:
-    1) filtra prima la struttura corretta in base alla zona scelta;
-    2) controlla camera per camera tramite iCal;
-    3) restituisce tutte le camere disponibili, non solo la più economica.
-    """
     try:
         check_in = parse_date(str(session.get("check_in", "")))
         check_out = parse_date(str(session.get("check_out", "")))
@@ -2041,17 +2068,17 @@ def check_whatsapp_availability_for_session(session: dict) -> dict:
     struttura_request = normalize(str(session.get("structure", "Benevento") or "Benevento"))
 
     camere_struttura = camere[
-        camere["struttura_key"].astype(str).str.lower().str.contains(struttura_request, na=False, regex=False)
-        |
         camere["nome_struttura"].astype(str).str.lower().str.contains(struttura_request, na=False, regex=False)
+        |
+        camere["struttura_key"].astype(str).str.lower().str.contains(struttura_request, na=False, regex=False)
         |
         camere["citta"].astype(str).str.lower().str.contains(struttura_request, na=False, regex=False)
     ].copy()
 
     if camere_struttura.empty:
-        return error_response(
-            f"Non ho trovato la struttura/zona richiesta: {session.get('zona_label') or session.get('structure')}."
-        )
+        camere_struttura = camere.copy()
+
+    camere_struttura = apply_room_filter_for_whatsapp(camere_struttura, session)
 
     disponibili = []
     disponibilita_per_camera_key: Dict[str, bool] = {}
@@ -2089,7 +2116,6 @@ def check_whatsapp_availability_for_session(session: dict) -> dict:
                 camera = future_map[future]
                 camera_key = str(camera["camera_key"]).strip()
                 nome_camera = str(camera["nome_camera"]).strip()
-                nome_struttura = str(camera.get("nome_struttura", "")).strip()
                 url_camera = str(camera.get("url_airbnb", "")).strip()
                 zona_label = str(session.get("zona_label", "")).strip()
 
@@ -2105,8 +2131,7 @@ def check_whatsapp_availability_for_session(session: dict) -> dict:
 
                 try:
                     total_price = get_total_price_from_df(prezzi, camera_key, check_in, check_out)
-                except Exception as prezzo_error:
-                    print(f"Prezzo non calcolato per {camera_key}: {prezzo_error}")
+                except Exception:
                     continue
 
                 disponibili.append({
@@ -2114,14 +2139,12 @@ def check_whatsapp_availability_for_session(session: dict) -> dict:
                     "camera_key": camera_key,
                     "total_price": total_price,
                     "url_camera": url_camera,
-                    "zona": zona_label,
-                    "structure": nome_struttura
+                    "zona": zona_label
                 })
 
     for _, camera in camere_combinate.iterrows():
         camera_key = str(camera["camera_key"]).strip()
         nome_camera = str(camera["nome_camera"]).strip()
-        nome_struttura = str(camera.get("nome_struttura", "")).strip()
         max_ospiti = safe_int(camera["max_ospiti"])
         url_camera = str(camera.get("url_airbnb", "")).strip()
         zona_label = str(session.get("zona_label", "")).strip()
@@ -2149,8 +2172,7 @@ def check_whatsapp_availability_for_session(session: dict) -> dict:
 
         try:
             total_price = get_total_price_from_df(prezzi, camera_key, check_in, check_out)
-        except Exception as prezzo_error:
-            print(f"Prezzo non calcolato per combinata {camera_key}: {prezzo_error}")
+        except Exception:
             continue
 
         disponibili.append({
@@ -2158,165 +2180,45 @@ def check_whatsapp_availability_for_session(session: dict) -> dict:
             "camera_key": camera_key,
             "total_price": total_price,
             "url_camera": url_camera,
-            "zona": zona_label,
-            "structure": nome_struttura
+            "zona": zona_label
         })
 
-    disponibili_validi = [
-        camera for camera in disponibili
-        if float(camera.get("total_price", 0) or 0) > 0
-    ]
+    if not disponibili:
+        return error_response(
+            f"Mi dispiace, non risultano disponibilità dal {session.get('check_in')} "
+            f"al {session.get('check_out')} per {guests} ospiti."
+        )
+
+    disponibili_validi = [camera for camera in disponibili if camera["total_price"] > 0]
 
     if not disponibili_validi:
         return error_response(
-            f"Mi dispiace, non risultano disponibilità dal {session.get('check_in')} "
-            f"al {session.get('check_out')} per {guests} ospiti nella zona scelta."
+            "Ho trovato disponibilità, ma non riesco a calcolare correttamente il prezzo. "
+            "Verifica il foglio PREZZI."
         )
 
-    disponibili_validi = sorted(
-        disponibili_validi,
-        key=lambda x: (float(x.get("total_price", 0) or 0), str(x.get("room_name", "")))
-    )
-
-    migliore = disponibili_validi[0]
+    migliore = sorted(disponibili_validi, key=lambda x: x["total_price"])[0]
 
     return {
         "available": True,
         "message": (
-            f"Sì, abbiamo disponibilità nella zona {session.get('zona_label') or 'selezionata'}. "
-            f"Ho trovato {len(disponibili_validi)} camera/e disponibili."
+            f"Sì, abbiamo disponibilità per {migliore['room_name']}. "
+            f"Il prezzo totale dal {session.get('check_in')} al {session.get('check_out')} "
+            f"è {migliore['total_price']} euro."
         ),
         "room_name": migliore["room_name"],
         "camera_key": migliore["camera_key"],
         "total_price": migliore["total_price"],
         "url_camera": migliore["url_camera"],
-        "zona": migliore.get("zona", ""),
-        "structure": migliore.get("structure", ""),
-        "available_rooms": disponibili_validi
+        "zona": migliore.get("zona", "")
     }
-
-
-def build_rooms_list(rooms: List[dict]) -> str:
-    lines = []
-
-    for index, room in enumerate(rooms, start=1):
-        room_name = str(room.get("room_name", "")).strip()
-        total_price = format_euro(room.get("total_price", 0))
-        url_camera = str(room.get("url_camera", "")).strip()
-
-        line = f"{index}) {room_name} - € {total_price}"
-
-        if url_camera:
-            line += f"\n   Foto/dettagli: {url_camera}"
-
-        lines.append(line)
-
-    return "\n".join(lines)
-
-
-def room_result_from_room(session: dict, room: dict) -> dict:
-    return {
-        "available": True,
-        "message": (
-            f"Sì, abbiamo disponibilità per {room.get('room_name', '')}. "
-            f"Il prezzo totale dal {session.get('check_in')} al {session.get('check_out')} "
-            f"è {room.get('total_price', 0)} euro."
-        ),
-        "room_name": room.get("room_name", ""),
-        "camera_key": room.get("camera_key", ""),
-        "total_price": room.get("total_price", 0),
-        "url_camera": room.get("url_camera", ""),
-        "zona": room.get("zona", ""),
-        "structure": room.get("structure", "")
-    }
-
-
-def select_room_from_message(message: str, rooms: List[dict]) -> Optional[dict]:
-    text_l = normalize_for_match(message)
-
-    if not rooms:
-        return None
-
-    choices = {
-        "a": 1,
-        "b": 2,
-        "c": 3,
-        "d": 4,
-        "e": 5,
-        "f": 6
-    }
-
-    if text_l in choices:
-        index = choices[text_l] - 1
-        if 0 <= index < len(rooms):
-            return rooms[index]
-
-    if re.fullmatch(r"\d+", text_l):
-        index = int(text_l) - 1
-        if 0 <= index < len(rooms):
-            return rooms[index]
-
-    for room in rooms:
-        room_name = normalize_for_match(room.get("room_name", ""))
-        camera_key = normalize_for_match(room.get("camera_key", ""))
-
-        if text_l and (text_l in room_name or text_l in camera_key or room_name in text_l or camera_key in text_l):
-            return room
-
-    return None
-
-
-def build_selected_tonight_room_reply(session: dict, selected_result: dict) -> str:
-    session["last_availability"] = selected_result
-    session["step"] = "urgent_wait_contact"
-
-    url_camera = str(selected_result.get("url_camera", "")).strip()
-    url_line = f"\n\nPuoi vedere foto e dettagli della camera qui:\n{url_camera}" if url_camera else ""
-
-    return (
-        "Perfetto, ho selezionato questa soluzione per questa sera:\n\n"
-        f"Struttura: {selected_result.get('structure') or 'Janara'}\n"
-        f"Camera: {selected_result.get('room_name', '')}\n"
-        f"Zona: {session.get('zona_label') or selected_result.get('zona') or 'Benevento'}\n"
-        f"Periodo: questa sera\n"
-        f"Ospiti: {session.get('guests')}\n"
-        f"Totale soggiorno: € {format_euro(selected_result.get('total_price', 0))}"
-        f"{url_line}\n\n"
-        "Per preparare il link di pagamento sicuro SumUp, scrivimi:\n\n"
-        "Nome e cognome\n"
-        "Telefono\n\n"
-        "Dopo questi dati ti chiederò la foto del documento di identità, "
-        "che sarà inviata in modo riservato alla struttura e verificata da un operatore."
-    )
-
-
-def build_selected_normal_room_reply(session: dict, selected_result: dict) -> str:
-    session["last_availability"] = selected_result
-    session["step"] = "post_availability_choice"
-
-    url_camera = str(selected_result.get("url_camera", "")).strip()
-    url_line = f"\n\nPuoi vedere foto e dettagli della camera qui:\n{url_camera}" if url_camera else ""
-
-    return (
-        "Perfetto, ho selezionato questa soluzione:\n\n"
-        f"Struttura: {selected_result.get('structure') or 'Janara'}\n"
-        f"Camera: {selected_result.get('room_name', '')}\n"
-        f"Zona: {session.get('zona_label') or selected_result.get('zona') or 'Benevento'}\n"
-        f"Periodo: {session.get('check_in')} - {session.get('check_out')}\n"
-        f"Ospiti: {session.get('guests')}\n"
-        f"Totale soggiorno: € {format_euro(selected_result.get('total_price', 0))}"
-        f"{url_line}\n\n"
-        "Vuoi ricevere il riepilogo con il link di pagamento?\n\n"
-        "a) Sì, voglio ricevere riepilogo e pagamento\n"
-        "b) No\n"
-        "c) Voglio parlare con un operatore"
-    )
 
 
 def build_tonight_offer_reply(session: dict, result: dict) -> str:
+    session["last_availability"] = result
+    session["step"] = "urgent_wait_contact"
+
     if not result.get("available"):
-        session["last_availability"] = result
-        session["step"] = "urgent_wait_contact"
         return (
             "Al momento non trovo disponibilità automatica per questa sera con i dati indicati.\n\n"
             "Essendo una richiesta urgente, ti consigliamo comunque di parlare direttamente "
@@ -2325,45 +2227,49 @@ def build_tonight_offer_reply(session: dict, result: dict) -> str:
             "Ho registrato la tua richiesta come urgente."
         )
 
-    rooms = result.get("available_rooms") or []
-
-    if len(rooms) == 1:
-        selected_result = room_result_from_room(session, rooms[0])
-        return build_selected_tonight_room_reply(session, selected_result)
-
-    session["available_rooms"] = rooms
-    session["last_availability"] = result
-    session["step"] = "urgent_choose_room"
+    url_camera = str(result.get("url_camera", "")).strip()
+    url_line = f"\n\nPuoi vedere foto e dettagli della camera qui:\n{url_camera}" if url_camera else ""
 
     return (
-        "Per questa sera ho trovato queste camere disponibili nella zona scelta:\n\n"
-        f"{build_rooms_list(rooms)}\n\n"
-        "Rispondi con il numero della camera che preferisci, ad esempio 1 oppure 2.\n\n"
-        f"Per urgenze puoi anche chiamare o scrivere al numero:\n{WHATSAPP_OPERATOR_PHONE}"
+        "Ho trovato una possibile soluzione disponibile per questa sera:\n\n"
+        f"Struttura: Janara\n"
+        f"Camera: {result.get('room_name', '')}\n"
+        f"Zona: {session.get('zona_label') or result.get('zona') or 'Benevento'}\n"
+        f"Periodo: questa sera\n"
+        f"Ospiti: {session.get('guests')}\n"
+        f"Totale soggiorno: € {format_euro(result.get('total_price', 0))}"
+        f"{url_line}\n\n"
+        "Per preparare il link di pagamento sicuro SumUp, scrivimi:\n\n"
+        "Nome e cognome\n"
+        "Telefono\n\n"
+        "Dopo questi dati ti chiederò la foto del documento di identità, "
+        "che sarà salvata in modo riservato e verificata da un operatore."
     )
 
 
 def build_normal_offer_reply(session: dict, result: dict) -> str:
+    session["last_availability"] = result
+    session["step"] = "post_availability_choice"
+
     if not result.get("available"):
-        session["last_availability"] = result
-        session["step"] = "ask_date_choice"
         return result.get("message", "Non risultano disponibilità per i dati indicati.")
 
-    rooms = result.get("available_rooms") or []
-
-    if len(rooms) == 1:
-        selected_result = room_result_from_room(session, rooms[0])
-        return build_selected_normal_room_reply(session, selected_result)
-
-    session["available_rooms"] = rooms
-    session["last_availability"] = result
-    session["step"] = "choose_room"
+    url_camera = str(result.get("url_camera", "")).strip()
+    url_line = f"\n\nPuoi vedere foto e dettagli della camera qui:\n{url_camera}" if url_camera else ""
 
     return (
-        "Ho trovato queste camere disponibili nella zona scelta:\n\n"
-        f"{build_rooms_list(rooms)}\n\n"
-        "Rispondi con il numero della camera che preferisci, ad esempio 1 oppure 2.\n\n"
-        "Se invece vuoi parlare con un operatore, scrivi: operatore"
+        "Ho trovato questa soluzione disponibile:\n\n"
+        f"Struttura: Janara\n"
+        f"Camera: {result.get('room_name', '')}\n"
+        f"Zona: {session.get('zona_label') or result.get('zona') or 'Benevento'}\n"
+        f"Periodo: {session.get('check_in')} - {session.get('check_out')}\n"
+        f"Ospiti: {session.get('guests')}\n"
+        f"Totale soggiorno: € {format_euro(result.get('total_price', 0))}"
+        f"{url_line}\n\n"
+        "Vuoi ricevere il riepilogo con il link di pagamento?\n\n"
+        "a) Sì, voglio ricevere riepilogo e pagamento\n"
+        "b) No\n"
+        "c) Voglio parlare con un operatore"
     )
 
 
@@ -2768,7 +2674,7 @@ def handle_whatsapp_message(
         return build_zone_menu()
 
     if step == "ask_zone":
-        zone_key, zone_label, structure_key = parse_zone_choice(message)
+        zone_key, zone_label, allowed_keywords = parse_zone_choice(message)
 
         if not zone_key:
             return (
@@ -2778,8 +2684,7 @@ def handle_whatsapp_message(
 
         session["zona"] = zone_key
         session["zona_label"] = zone_label
-        session["structure"] = structure_key
-        session["available_rooms"] = []
+        session["allowed_camera_keywords"] = allowed_keywords
         session["step"] = "ask_date_choice"
 
         return build_date_choice_menu()
@@ -2824,34 +2729,6 @@ def handle_whatsapp_message(
         result = check_whatsapp_availability_for_session(session)
         return build_normal_offer_reply(session, result)
 
-    if step == "choose_room":
-        rooms = session.get("available_rooms") or []
-        selected_room = select_room_from_message(message, rooms)
-
-        if not selected_room:
-            return (
-                "Non ho capito quale camera preferisci.\n\n"
-                "Rispondi con il numero della camera, ad esempio 1 oppure 2.\n\n"
-                f"{build_rooms_list(rooms)}"
-            )
-
-        selected_result = room_result_from_room(session, selected_room)
-        return build_selected_normal_room_reply(session, selected_result)
-
-    if step == "urgent_choose_room":
-        rooms = session.get("available_rooms") or []
-        selected_room = select_room_from_message(message, rooms)
-
-        if not selected_room:
-            return (
-                "Non ho capito quale camera preferisci per questa sera.\n\n"
-                "Rispondi con il numero della camera, ad esempio 1 oppure 2.\n\n"
-                f"{build_rooms_list(rooms)}"
-            )
-
-        selected_result = room_result_from_room(session, selected_room)
-        return build_selected_tonight_room_reply(session, selected_result)
-
     if step == "post_availability_choice":
         if is_confirmation_intent(message):
             session["step"] = "wait_booking_contact"
@@ -2869,7 +2746,7 @@ def handle_whatsapp_message(
                 "o altre zone."
             )
 
-        if is_operator_intent(message):
+        if message_l in ["c", "3"] or is_operator_intent(message):
             session["urgent_note"] = "RICHIESTA OPERATORE"
             return build_operator_reply()
 
