@@ -90,6 +90,43 @@ ICAL_CACHE_SECONDS = int(os.environ.get("ICAL_CACHE_SECONDS", "120"))
 
 MAX_ICAL_WORKERS = int(os.environ.get("MAX_ICAL_WORKERS", "6"))
 
+# Chiamate vocali Vapi: controllo disponibilità leggero.
+# Le camere vengono controllate una alla volta in questo ordine.
+# Appena il sistema trova una camera disponibile con prezzo valido, risponde subito.
+VOICE_ROOM_ORDER = [
+    ["arechi"],
+    ["iside"],
+    ["santa sofia", "santa_sofia"],
+    ["traiano", "arco di traiano", "arco_di_traiano"],
+    ["duomo"],
+    ["port arsa", "port'arsa", "port’arsa", "port_arsa"],
+    ["teatro romano", "teatro_romano"],
+    ["mura longobarde", "mura_longobarde"],
+]
+
+VOICE_ZONE_CAMERA_ALIASES = {
+    "via_annunziata": [
+        "arechi",
+        "iside",
+        "santa sofia",
+        "santa_sofia",
+        "traiano",
+        "arco di traiano",
+        "arco_di_traiano",
+        "duomo",
+    ],
+    "triggio": [
+        "port arsa",
+        "port'arsa",
+        "port’arsa",
+        "port_arsa",
+        "teatro romano",
+        "teatro_romano",
+        "mura longobarde",
+        "mura_longobarde",
+    ],
+}
+
 # SumUp
 SUMUP_API_KEY = os.environ.get("SUMUP_API_KEY", "")
 SUMUP_MERCHANT_CODE = os.environ.get("SUMUP_MERCHANT_CODE", "")
@@ -401,6 +438,98 @@ def google_sheet_csv_url(gid: str) -> str:
 
 def normalize(value: str) -> str:
     return str(value).strip().lower()
+
+
+def normalize_room_text(value: str) -> str:
+    value = normalize(value)
+    value = value.replace("’", "'")
+    value = re.sub(r"[^a-z0-9àèéìòù'\s]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def row_room_text(row) -> str:
+    return normalize_room_text(
+        f"{row.get('camera_key', '')} {row.get('nome_camera', '')} "
+        f"{row.get('nome_struttura', '')} {row.get('struttura_key', '')}"
+    )
+
+
+def alias_matches_text(alias: str, text: str) -> bool:
+    alias_norm = normalize_room_text(alias).replace("_", " ")
+    text_norm = normalize_room_text(text).replace("_", " ")
+    return bool(alias_norm and alias_norm in text_norm)
+
+
+def voice_room_order_index(row) -> int:
+    text = row_room_text(row)
+
+    for index, alias_group in enumerate(VOICE_ROOM_ORDER):
+        for alias in alias_group:
+            if alias_matches_text(alias, text):
+                return index
+
+    return 999
+
+
+def sort_rooms_for_voice(camere_df: pd.DataFrame) -> pd.DataFrame:
+    if camere_df.empty:
+        return camere_df
+
+    ordered = camere_df.copy()
+    ordered["__voice_order"] = ordered.apply(voice_room_order_index, axis=1)
+    ordered = ordered.sort_values(["__voice_order", "nome_camera", "camera_key"])
+    return ordered.drop(columns=["__voice_order"], errors="ignore")
+
+
+def filter_specific_room_request(camere_df: pd.DataFrame, request_text: str) -> pd.DataFrame:
+    request_norm = normalize_room_text(request_text)
+
+    if not request_norm:
+        return camere_df
+
+    matched_aliases = []
+
+    for alias_group in VOICE_ROOM_ORDER:
+        for alias in alias_group:
+            if alias_matches_text(alias, request_norm):
+                matched_aliases.append(alias)
+
+    if not matched_aliases:
+        return camere_df
+
+    def row_matches(row) -> bool:
+        text = row_room_text(row)
+        return any(alias_matches_text(alias, text) for alias in matched_aliases)
+
+    filtered = camere_df[camere_df.apply(row_matches, axis=1)].copy()
+    return filtered if not filtered.empty else camere_df
+
+
+def filter_voice_zone_request(camere_df: pd.DataFrame, request_text: str) -> pd.DataFrame:
+    request_norm = normalize_room_text(request_text)
+
+    if not request_norm:
+        return camere_df
+
+    zone_key = ""
+
+    if any(k in request_norm for k in ["annunziata", "centro storico", "centro"]):
+        zone_key = "via_annunziata"
+    elif any(k in request_norm for k in ["triggio", "teatro romano"]):
+        zone_key = "triggio"
+
+    if not zone_key:
+        return camere_df
+
+    aliases = VOICE_ZONE_CAMERA_ALIASES.get(zone_key, [])
+
+    def row_matches(row) -> bool:
+        text = row_room_text(row)
+        return any(alias_matches_text(alias, text) for alias in aliases)
+
+    filtered = camere_df[camere_df.apply(row_matches, axis=1)].copy()
+    return filtered if not filtered.empty else camere_df
 
 
 def parse_date(value: str) -> date:
@@ -1031,6 +1160,16 @@ def health():
 
 @app.post("/check-availability")
 def check_availability(req: AvailabilityRequest):
+    """
+    Endpoint usato soprattutto dall'assistente vocale Vapi.
+
+    Logica ottimizzata per la telefonata:
+    - filtra per struttura/zona/camera richiesta;
+    - rispetta il numero ospiti;
+    - controlla gli iCal una camera alla volta secondo VOICE_ROOM_ORDER;
+    - appena trova una camera disponibile con prezzo valido, risponde subito;
+    - evita il controllo parallelo di tutte le camere, riducendo timeout e cadute linea.
+    """
     try:
         check_in = parse_date(req.check_in)
         check_out = parse_date(req.check_out)
@@ -1061,131 +1200,73 @@ def check_availability(req: AvailabilityRequest):
         camere["attiva"].astype(str).str.upper().str.strip() == "SI"
     ].copy()
 
-    struttura_request = normalize(req.structure)
+    struttura_request = normalize(str(req.structure or ""))
 
-    camere_struttura = camere[
-        camere["nome_struttura"]
-        .astype(str)
-        .str.lower()
-        .str.contains(struttura_request, na=False, regex=False)
-        |
-        camere["struttura_key"]
-        .astype(str)
-        .str.lower()
-        .str.contains(struttura_request, na=False, regex=False)
-        |
-        camere["citta"]
-        .astype(str)
-        .str.lower()
-        .str.contains(struttura_request, na=False, regex=False)
-    ].copy()
+    # Se Vapi passa "Benevento", filtro per città/struttura.
+    # Se passa una camera precisa, per esempio "Santa Sofia", filtro anche per nome_camera/camera_key.
+    if struttura_request:
+        camere_struttura = camere[
+            camere["nome_struttura"].astype(str).str.lower().str.contains(struttura_request, na=False, regex=False)
+            |
+            camere["struttura_key"].astype(str).str.lower().str.contains(struttura_request, na=False, regex=False)
+            |
+            camere["citta"].astype(str).str.lower().str.contains(struttura_request, na=False, regex=False)
+            |
+            camere["nome_camera"].astype(str).str.lower().str.contains(struttura_request, na=False, regex=False)
+            |
+            camere["camera_key"].astype(str).str.lower().str.contains(struttura_request, na=False, regex=False)
+        ].copy()
+    else:
+        camere_struttura = camere.copy()
 
+    # Sicurezza: se il testo passato da Vapi non coincide con i nomi del foglio,
+    # non blocco la chiamata. Uso l'elenco camere attive e poi applico ordine/filtri voce.
     if camere_struttura.empty:
-        return error_response(
-            f"Non ho trovato la struttura richiesta: {req.structure}. Puoi ripetere il nome?"
-        )
+        camere_struttura = camere.copy()
+
+    # Camera precisa: se il cliente chiede "Santa Sofia", "Arechi", ecc., controllo solo quella.
+    camere_struttura = filter_specific_room_request(camere_struttura, str(req.structure or ""))
+
+    # Zona: se il cliente chiede Via Annunziata/Centro o Triggio, riduco le camere candidate.
+    camere_struttura = filter_voice_zone_request(camere_struttura, str(req.structure or ""))
 
     disponibili = []
     disponibilita_per_camera_key: Dict[str, bool] = {}
 
     camere_standard = camere_struttura[
-        camere_struttura["tipo_camera"]
-        .astype(str)
-        .str.lower()
-        .str.strip() != "combinata"
+        camere_struttura["tipo_camera"].astype(str).str.lower().str.strip() != "combinata"
     ].copy()
 
     camere_combinate = camere_struttura[
-        camere_struttura["tipo_camera"]
-        .astype(str)
-        .str.lower()
-        .str.strip() == "combinata"
+        camere_struttura["tipo_camera"].astype(str).str.lower().str.strip() == "combinata"
     ].copy()
 
-    camere_standard_ok = []
+    # 1) Camere standard: controllo sequenziale secondo ordine voce.
+    camere_standard = sort_rooms_for_voice(camere_standard)
 
     for _, camera in camere_standard.iterrows():
         camera_key = str(camera["camera_key"]).strip()
+        nome_camera = str(camera["nome_camera"]).strip()
+        url_camera = str(camera.get("url_airbnb", "")).strip()
         max_ospiti = safe_int(camera["max_ospiti"])
 
         if req.guests > max_ospiti:
             disponibilita_per_camera_key[camera_key] = False
             continue
 
-        camere_standard_ok.append(camera)
+        try:
+            disponibile = is_available_from_ical(
+                str(camera["ical_url"]).strip(),
+                check_in,
+                check_out
+            )
+        except Exception as e:
+            print(f"Errore controllo iCal voce per {camera_key}: {str(e)}")
+            disponibile = False
 
-    if camere_standard_ok:
-        workers = min(MAX_ICAL_WORKERS, len(camere_standard_ok))
+        disponibilita_per_camera_key[camera_key] = disponibile
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_map = {
-                executor.submit(
-                    check_single_room_availability,
-                    camera,
-                    check_in,
-                    check_out
-                ): camera
-                for camera in camere_standard_ok
-            }
-
-            for future in as_completed(future_map):
-                camera = future_map[future]
-                camera_key = str(camera["camera_key"]).strip()
-                nome_camera = str(camera["nome_camera"]).strip()
-                url_camera = str(camera.get("url_airbnb", "")).strip()
-
-                try:
-                    _, disponibile = future.result()
-                except Exception:
-                    disponibile = False
-
-                disponibilita_per_camera_key[camera_key] = disponibile
-
-                if not disponibile:
-                    continue
-
-                try:
-                    total_price = get_total_price_from_df(
-                        prezzi,
-                        camera_key,
-                        check_in,
-                        check_out
-                    )
-                except Exception:
-                    continue
-
-                disponibili.append({
-                    "room_name": nome_camera,
-                    "camera_key": camera_key,
-                    "total_price": total_price,
-                    "url_camera": url_camera
-                })
-
-    for _, camera in camere_combinate.iterrows():
-        camera_key = str(camera["camera_key"]).strip()
-        nome_camera = str(camera["nome_camera"]).strip()
-        max_ospiti = safe_int(camera["max_ospiti"])
-        url_camera = str(camera.get("url_airbnb", "")).strip()
-
-        if req.guests > max_ospiti:
-            continue
-
-        dipendenze = ""
-
-        if "camere_dipendenti" in camere.columns:
-            dipendenze = str(camera.get("camere_dipendenti", "")).strip()
-
-        dip_keys = [x.strip() for x in dipendenze.split(",") if x.strip()]
-
-        if not dip_keys:
-            continue
-
-        combinata_disponibile = all(
-            disponibilita_per_camera_key.get(dep, False)
-            for dep in dip_keys
-        )
-
-        if not combinata_disponibile:
+        if not disponibile:
             continue
 
         try:
@@ -1195,7 +1276,11 @@ def check_availability(req: AvailabilityRequest):
                 check_in,
                 check_out
             )
-        except Exception:
+        except Exception as e:
+            print(f"Errore prezzo voce per {camera_key}: {str(e)}")
+            continue
+
+        if total_price <= 0:
             continue
 
         disponibili.append({
@@ -1205,24 +1290,102 @@ def check_availability(req: AvailabilityRequest):
             "url_camera": url_camera
         })
 
+        # Voce: appena trovo una soluzione valida, mi fermo.
+        break
+
+    # 2) Camere combinate: vengono valutate solo se non ho già trovato una standard.
+    # Per le combinate controllo le dipendenze, ma sempre in modo ordinato/leggero.
+    if not disponibili and not camere_combinate.empty:
+        camere_combinate = sort_rooms_for_voice(camere_combinate)
+
+        for _, camera in camere_combinate.iterrows():
+            camera_key = str(camera["camera_key"]).strip()
+            nome_camera = str(camera["nome_camera"]).strip()
+            max_ospiti = safe_int(camera["max_ospiti"])
+            url_camera = str(camera.get("url_airbnb", "")).strip()
+
+            if req.guests > max_ospiti:
+                continue
+
+            dipendenze = ""
+
+            if "camere_dipendenti" in camere.columns:
+                dipendenze = str(camera.get("camere_dipendenti", "")).strip()
+
+            dip_keys = [x.strip() for x in dipendenze.split(",") if x.strip()]
+
+            if not dip_keys:
+                continue
+
+            combinata_disponibile = True
+
+            for dep_key in dip_keys:
+                dep_key = str(dep_key).strip()
+
+                if dep_key in disponibilita_per_camera_key:
+                    if not disponibilita_per_camera_key.get(dep_key, False):
+                        combinata_disponibile = False
+                        break
+                    continue
+
+                dep_match = camere_standard[
+                    camere_standard["camera_key"].astype(str).str.strip() == dep_key
+                ]
+
+                if dep_match.empty:
+                    combinata_disponibile = False
+                    break
+
+                dep_row = dep_match.iloc[0]
+
+                try:
+                    dep_available = is_available_from_ical(
+                        str(dep_row["ical_url"]).strip(),
+                        check_in,
+                        check_out
+                    )
+                except Exception as e:
+                    print(f"Errore controllo iCal dipendenza {dep_key}: {str(e)}")
+                    dep_available = False
+
+                disponibilita_per_camera_key[dep_key] = dep_available
+
+                if not dep_available:
+                    combinata_disponibile = False
+                    break
+
+            if not combinata_disponibile:
+                continue
+
+            try:
+                total_price = get_total_price_from_df(
+                    prezzi,
+                    camera_key,
+                    check_in,
+                    check_out
+                )
+            except Exception as e:
+                print(f"Errore prezzo combinata voce per {camera_key}: {str(e)}")
+                continue
+
+            if total_price <= 0:
+                continue
+
+            disponibili.append({
+                "room_name": nome_camera,
+                "camera_key": camera_key,
+                "total_price": total_price,
+                "url_camera": url_camera
+            })
+            break
+
     if not disponibili:
         return error_response(
             f"Mi dispiace, non risultano disponibilità dal {req.check_in} "
             f"al {req.check_out} per {req.guests} ospiti."
         )
 
-    disponibili_validi = [
-        camera for camera in disponibili
-        if camera["total_price"] > 0
-    ]
-
-    if not disponibili_validi:
-        return error_response(
-            "Ho trovato disponibilità, ma non riesco a calcolare correttamente il prezzo. "
-            "Verifica il foglio PREZZI."
-        )
-
-    migliore = sorted(disponibili_validi, key=lambda x: x["total_price"])[0]
+    migliore = disponibili[0]
 
     return {
         "available": True,
