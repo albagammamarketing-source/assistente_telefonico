@@ -2299,7 +2299,7 @@ def send_whatsapp_document_to_operator_email(
         auth = None
 
         if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-        return False, "", "Credenziali Twilio mancanti: TWILIO_ACCOUNT_SID o TWILIO_AUTH_TOKEN non configurati."
+            return False, "", "Credenziali Twilio mancanti: TWILIO_ACCOUNT_SID o TWILIO_AUTH_TOKEN non configurati."
 
 response = http.get(
     media_url,
