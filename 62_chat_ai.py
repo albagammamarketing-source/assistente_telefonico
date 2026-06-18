@@ -2298,15 +2298,15 @@ def send_whatsapp_document_to_operator_email(
     try:
         auth = None
 
-        if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
-            auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+    return False, "", "Credenziali Twilio mancanti: TWILIO_ACCOUNT_SID o TWILIO_AUTH_TOKEN non configurati."
 
-        response = http.get(
-            media_url,
-            auth=auth,
-            timeout=REQUEST_TIMEOUT_SECONDS
-        )
-        response.raise_for_status()
+response = http.get(
+    media_url,
+    auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+    timeout=REQUEST_TIMEOUT_SECONDS
+)
+response.raise_for_status()
 
         content_type = media_content_type or response.headers.get(
             "Content-Type",
