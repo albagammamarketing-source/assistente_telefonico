@@ -1732,6 +1732,15 @@ def format_euro(value) -> str:
         return str(value)
 
 
+def calculate_nights(check_in: str, check_out: str) -> int:
+    try:
+        d1 = parse_date(str(check_in))
+        d2 = parse_date(str(check_out))
+        return max((d2 - d1).days, 0)
+    except Exception:
+        return 0
+
+
 def get_whatsapp_session(from_number: str) -> dict:
     key = str(from_number or "unknown").strip()
 
@@ -2236,6 +2245,7 @@ def build_tonight_offer_reply(session: dict, result: dict) -> str:
         f"Camera: {result.get('room_name', '')}\n"
         f"Zona: {session.get('zona_label') or result.get('zona') or 'Benevento'}\n"
         f"Periodo: questa sera\n"
+        f"Notti: 1\n"
         f"Ospiti: {session.get('guests')}\n"
         f"Totale soggiorno: € {format_euro(result.get('total_price', 0))}"
         f"{url_line}\n\n"
@@ -2256,6 +2266,7 @@ def build_normal_offer_reply(session: dict, result: dict) -> str:
 
     url_camera = str(result.get("url_camera", "")).strip()
     url_line = f"\n\nPuoi vedere foto e dettagli della camera qui:\n{url_camera}" if url_camera else ""
+    notti = calculate_nights(session.get("check_in", ""), session.get("check_out", ""))
 
     return (
         "Ho trovato questa soluzione disponibile:\n\n"
@@ -2263,6 +2274,7 @@ def build_normal_offer_reply(session: dict, result: dict) -> str:
         f"Camera: {result.get('room_name', '')}\n"
         f"Zona: {session.get('zona_label') or result.get('zona') or 'Benevento'}\n"
         f"Periodo: {session.get('check_in')} - {session.get('check_out')}\n"
+        f"Notti: {notti}\n"
         f"Ospiti: {session.get('guests')}\n"
         f"Totale soggiorno: € {format_euro(result.get('total_price', 0))}"
         f"{url_line}\n\n"
@@ -2295,18 +2307,19 @@ def send_whatsapp_document_to_operator_email(
     if not WHATSAPP_DOCUMENT_EMAIL:
         return False, "", "WHATSAPP_DOCUMENT_EMAIL non configurata."
 
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+        return False, "", (
+            "Credenziali Twilio mancanti: "
+            "TWILIO_ACCOUNT_SID o TWILIO_AUTH_TOKEN non configurati."
+        )
+
     try:
-        auth = None
-
-        if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-            return False, "", "Credenziali Twilio mancanti: TWILIO_ACCOUNT_SID o TWILIO_AUTH_TOKEN non configurati."
-
-response = http.get(
-    media_url,
-    auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-    timeout=REQUEST_TIMEOUT_SECONDS
-)
-response.raise_for_status()
+        response = http.get(
+            media_url,
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+            timeout=REQUEST_TIMEOUT_SECONDS
+        )
+        response.raise_for_status()
 
         content_type = media_content_type or response.headers.get(
             "Content-Type",
@@ -2340,6 +2353,7 @@ response.raise_for_status()
         totale = ""
 
         result = session.get("last_availability") or {}
+
         if isinstance(result, dict):
             camera = str(result.get("room_name", "")).strip()
             totale = str(result.get("total_price", "")).strip()
@@ -2395,7 +2409,6 @@ response.raise_for_status()
 
     except Exception as e:
         return False, "", str(e)
-
 
 def create_urgent_sumup_and_reply(session: dict) -> str:
     result = session.get("last_availability") or {}
