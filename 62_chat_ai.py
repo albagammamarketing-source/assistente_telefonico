@@ -2821,7 +2821,6 @@ def handle_whatsapp_message(
 
     return build_guests_menu()
 
-
 # =========================
 # ENDPOINT WHATSAPP / TWILIO
 # =========================
@@ -2848,7 +2847,7 @@ async def whatsapp_webhook(request: Request):
     - Body: testo del messaggio ricevuto
     - From: numero WhatsApp del cliente
     - NumMedia: numero allegati/foto/documenti
-    - MediaUrl0: URL temporaneo primo allegato
+    - MediaUrl0: URL temporaneo del primo allegato
     - MediaContentType0: tipo file del primo allegato
 
     La risposta viene restituita in formato TwiML XML.
@@ -2862,6 +2861,7 @@ async def whatsapp_webhook(request: Request):
         from_number = str(parsed_body.get("From", [""])[0]).strip()
 
         num_media = safe_int(str(parsed_body.get("NumMedia", ["0"])[0]), 0)
+
         media_url = ""
         media_content_type = ""
 
@@ -2870,10 +2870,14 @@ async def whatsapp_webhook(request: Request):
             media_content_type = str(parsed_body.get("MediaContentType0", [""])[0]).strip()
 
         print(
-            f"Messaggio WhatsApp ricevuto da {from_number}: {incoming_message} "
-            f"- media: {num_media}"
+            f"Messaggio WhatsApp ricevuto da {from_number}: "
+            f"{incoming_message if incoming_message else '[ALLEGATO]'} "
+            f"- media: {num_media} "
+            f"- content_type: {media_content_type}"
         )
 
+        # Gestione messaggio WhatsApp.
+        # Questa funzione deve accettare anche media_url e media_content_type.
         reply = handle_whatsapp_message(
             from_number=from_number,
             incoming_message=incoming_message,
@@ -2881,10 +2885,15 @@ async def whatsapp_webhook(request: Request):
             media_content_type=media_content_type
         )
 
+        # Salvataggio log conversazione su Google Sheet
         try:
             session = WHATSAPP_SESSIONS.get(from_number, {})
 
-            status = session.get("document_status") or session.get("urgent_note") or "OK"
+            status = (
+                session.get("document_status")
+                or session.get("urgent_note")
+                or "OK"
+            )
 
             append_whatsapp_chat_log([
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -2907,10 +2916,12 @@ async def whatsapp_webhook(request: Request):
 
     except Exception as e:
         print(f"Errore generale webhook WhatsApp: {str(e)}")
+
         return twilio_xml_response(
             "Mi dispiace, ho avuto un problema tecnico. "
             "Riprova tra qualche istante oppure contatta direttamente la struttura."
         )
+
 
 if __name__ == "__main__":
     import uvicorn
