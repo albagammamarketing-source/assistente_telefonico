@@ -2714,16 +2714,27 @@ def try_send_booking_summary_from_whatsapp(session: dict, contact: dict) -> str:
 
         if email_result.get("success"):
             session["step"] = "completed"
-            reply = f"Perfetto {nome}, ti ho inviato il riepilogo a {email}."
+            reply = (
+                f"Perfetto {nome}.\n\n"
+                "Controlla la tua email: abbiamo inviato ora i dettagli per il pagamento.\n\n"
+                "Nell'email trovi il riepilogo della richiesta, il totale del soggiorno "
+                "e le istruzioni per confermare la prenotazione."
+            )
 
             if payment_link:
-                reply += f"\n\nPuoi confermare anche da questo link SumUp:\n{payment_link}"
+                reply += (
+                    "\n\nPer comodità puoi confermare anche direttamente da questo "
+                    "link sicuro SumUp:\n"
+                    f"{payment_link}"
+                )
             else:
-                reply += "\n\nNell'email trovi anche le istruzioni per il pagamento."
+                reply += (
+                    "\n\nSe non trovi l'email, controlla anche nella posta indesiderata o spam."
+                )
 
             reply += (
-                "\n\nPrima di procedere, se vuoi verificare che sia tutto corretto "
-                "o parlare con noi, puoi chiamare o scrivere al numero:\n"
+                "\n\nSe vuoi verificare che sia tutto corretto o parlare con noi, "
+                "puoi chiamare o scrivere al numero:\n"
                 f"{WHATSAPP_OPERATOR_PHONE}"
             )
 
