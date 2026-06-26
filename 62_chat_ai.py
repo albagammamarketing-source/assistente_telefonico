@@ -86,9 +86,23 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "8"))
 
 SHEET_CACHE_SECONDS = int(os.environ.get("SHEET_CACHE_SECONDS", "300"))
-ICAL_CACHE_SECONDS = int(os.environ.get("ICAL_CACHE_SECONDS", "120"))
 
-MAX_ICAL_WORKERS = int(os.environ.get("MAX_ICAL_WORKERS", "6"))
+# Cache iCal ridotta per contenere l'uso della RAM su Render.
+ICAL_CACHE_SECONDS = int(os.environ.get("ICAL_CACHE_SECONDS", "60"))
+
+# WhatsApp: numero massimo di controlli iCal paralleli.
+# Valore più basso = meno RAM usata, anche se il controllo può essere leggermente più lento.
+MAX_ICAL_WORKERS = int(os.environ.get("MAX_ICAL_WORKERS", "2"))
+
+# WhatsApp: pulizia automatica della memoria conversazionale.
+# Le sessioni sono salvate in RAM, quindi vanno eliminate quando diventano vecchie.
+WHATSAPP_SESSION_TTL_MINUTES = int(
+    os.environ.get("WHATSAPP_SESSION_TTL_MINUTES", "45")
+)
+
+WHATSAPP_MAX_SESSIONS = int(
+    os.environ.get("WHATSAPP_MAX_SESSIONS", "50")
+)
 
 # Chiamate vocali Vapi: controllo disponibilità leggero.
 # Le camere vengono controllate una alla volta in questo ordine.
@@ -1154,7 +1168,14 @@ def health():
         "google_credentials_path": GOOGLE_APPLICATION_CREDENTIALS,
         "internal_notification_email": INTERNAL_NOTIFICATION_EMAIL,
         "prenotazioni_sheet_name": PRENOTAZIONI_SHEET_NAME,
-        "whatsapp_document_email": WHATSAPP_DOCUMENT_EMAIL
+        "whatsapp_document_email": WHATSAPP_DOCUMENT_EMAIL,
+        "max_ical_workers": MAX_ICAL_WORKERS,
+        "ical_cache_seconds": ICAL_CACHE_SECONDS,
+        "whatsapp_session_ttl_minutes": WHATSAPP_SESSION_TTL_MINUTES,
+        "whatsapp_max_sessions": WHATSAPP_MAX_SESSIONS,
+        "whatsapp_active_sessions": len(WHATSAPP_SESSIONS),
+        "ical_cache_items": len(_ical_cache),
+        "sheet_cache_items": len(_sheet_cache)
     }
 
 
@@ -1936,6 +1957,49 @@ def reset_whatsapp_session(from_number: str):
         del WHATSAPP_SESSIONS[from_number]
 
 
+def cleanup_whatsapp_sessions():
+    """
+    Pulisce le sessioni WhatsApp vecchie per evitare consumo eccessivo di RAM.
+
+    WHATSAPP_SESSIONS è una memoria volatile:
+    - si svuota a ogni riavvio Render;
+    - cresce se molti numeri WhatsApp scrivono;
+    - va limitata per evitare superamento memoria.
+    """
+    now = datetime.utcnow()
+    ttl = timedelta(minutes=WHATSAPP_SESSION_TTL_MINUTES)
+
+    numbers_to_delete = []
+
+    for number, session in list(WHATSAPP_SESSIONS.items()):
+        last_updated_raw = str(session.get("last_updated", "")).strip()
+
+        try:
+            last_updated = datetime.fromisoformat(last_updated_raw)
+        except Exception:
+            numbers_to_delete.append(number)
+            continue
+
+        if now - last_updated > ttl:
+            numbers_to_delete.append(number)
+
+    for number in numbers_to_delete:
+        WHATSAPP_SESSIONS.pop(number, None)
+
+    # Se le sessioni sono ancora troppe, tengo solo le più recenti.
+    if len(WHATSAPP_SESSIONS) > WHATSAPP_MAX_SESSIONS:
+        ordered_sessions = sorted(
+            WHATSAPP_SESSIONS.items(),
+            key=lambda item: str(item[1].get("last_updated", "")),
+            reverse=True
+        )
+
+        sessions_to_keep = dict(ordered_sessions[:WHATSAPP_MAX_SESSIONS])
+
+        WHATSAPP_SESSIONS.clear()
+        WHATSAPP_SESSIONS.update(sessions_to_keep)
+
+
 def parse_italian_date_parts(day: int, month_name: str, year: Optional[int] = None) -> Optional[str]:
     month = ITALIAN_MONTHS.get(str(month_name).lower().strip())
 
@@ -2276,7 +2340,7 @@ def check_whatsapp_availability_for_session(session: dict) -> dict:
         camere_standard_ok.append(camera)
 
     if camere_standard_ok:
-        workers = min(MAX_ICAL_WORKERS, len(camere_standard_ok))
+        workers = max(1, min(MAX_ICAL_WORKERS, len(camere_standard_ok)))
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_map = {
@@ -2795,6 +2859,10 @@ def handle_whatsapp_message(
 ) -> str:
     message = str(incoming_message or "").strip()
     message_l = message.lower().strip()
+
+    # Pulizia leggera a ogni messaggio: evita che le conversazioni vecchie
+    # restino in RAM e causino restart automatici su Render.
+    cleanup_whatsapp_sessions()
 
     if message_l in ["reset", "ricomincia", "annulla"]:
         reset_whatsapp_session(from_number)
