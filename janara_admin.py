@@ -95,7 +95,7 @@ def read_registry():
     for index, row in enumerate(raw[1:], 2):
         name=cell(row,3)
         start=dt(cell(row,5)); end=dt(cell(row,8))
-        if not (name and start and end and end>start): continue
+        if not (name and start and end and end>=start): continue
         out.append({'row':index, 'name':name, 'room':cell(row,2), 'room_key':room_key(cell(row,2)),
                     'arrival':start, 'departure':end, 'paid_guest':amount(cell(row,14)),
                     'cash_due':amount(cell(row,15)), 'gross':amount(cell(row,23)),
@@ -275,7 +275,11 @@ def stats_request(q):
         'quanti soggiorni','numero di prenotazioni','quante prenotazioni',
         'quante notti','notti vendute','pernottament','media per notte',
         'per appartamento','per camera','per mese','mese per mese',
-        'classifica camere','confronta i mesi'
+        'classifica camere','confronta i mesi',
+        'quanto abbiamo fatto','quanto ho fatto','totale annuale','totale mensile',
+        'numero di arrivi','quanti arrivi','quante persone','numero di persone',
+        'totali per anno','totali per mese','rendiconto','bilancio gestionale',
+        'fatturazione','vendite annue','vendite mensili'
     ))
 
 
@@ -349,6 +353,8 @@ def stats_response(q,data=None):
         f"• Check-in / soggiorni registrati: {result['bookings']}",
         f"• Ospiti indicati (colonna E): {result['guests']}",
         f"• Notti dei soggiorni: {result['nights']}"]
+    if any(b['arrival']==b['departure'] for b,_ in selected):
+        lines.append(f"Nota: {sum(b['arrival']==b['departure'] for b,_ in selected)} righe con arrivo=partenza conteggiate come registrazioni, ma con 0 notti. Da verificare se siano veri check-in.")
     if result['missing_gross']:
         lines.append(f"⚠ Importo X mancante in {result['missing_gross']} soggiorni: ricavi parziali.")
     if result['missing_guests']:
@@ -376,6 +382,7 @@ def stats_response(q,data=None):
             st=add(rows)
             lines.append(f"• {key}: {fmt_money(st['revenue'])}; {st['bookings']} check-in; {st['guests']} ospiti; {st['nights']} notti"+(' (ricavi incompleti)' if st['missing_gross'] else ''))
     lines.append('')
+    lines.append(f'Righe valide incluse nel periodo: {len(selected)} su {len(data)} registrazioni con nome e date interpretabili nel foglio.')
     lines.append('Metodo: mese della colonna L; un check-in per riga/soggiorno valido, date F/I; ricavi lordi X. I ricavi sono gestionali, non fatturato fiscale né accrediti bancari. Soggiorni a cavallo di due mesi attribuiti al mese L, senza ripartizione per notte.')
     return {'text':'\n'.join(lines),'source':'Google Sheet check IN JAnara · colonne L, X, E, F, I · calcolo Python'}
 
@@ -390,6 +397,10 @@ def safe_guest_count(v):
 def ai_answer(q):
     """Use the OpenAI model for free-form read-only Q&A, fall back on known commands."""
     if stats_request(q):
+        return stats_response(q)
+    # Richieste quantitative storiche: calcolo su tutto il registro, mai sul contesto AI ridotto.
+    qlow=q.casefold()
+    if re.search(r'\b(20\d{2}|0?[1-9]_[0-9]{2}|1[0-2]_[0-9]{2})\b',qlow) and any(w in qlow for w in ('quanto','quanti','quante','totale','somma','conteggio','numero','media')) and any(w in qlow for w in ('euro','sold','import','guadagn','incass','prenot','soggiorn','ospit','arriv','check','nott','camera','appartament')):
         return stats_response(q)
     api_key=os.getenv('OPENAI_API_KEY','').strip()
     if not api_key: return answer(q)
