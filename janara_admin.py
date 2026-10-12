@@ -269,7 +269,7 @@ def stats_request(q):
     """Deterministic routing: the language model must not invent financial totals."""
     t=q.casefold()
     return any(k in t for k in (
-        'fatturat','ricav','incassato nell','guadagn','statistic','report',
+        'fatturat','ricav','incassat','incassi','pagato','pagamenti','guadagn','statistic','report',
         'quanti check','numero di check','numero check','check-in totali',
         'check in totali','quanti ospiti','numero di ospiti','ospiti sono venuti',
         'quanti soggiorni','numero di prenotazioni','quante prenotazioni',
@@ -347,9 +347,19 @@ def stats_response(q,data=None):
                 'guests':guests,'missing_guests':sum(v is None for v in guest_values),
                 'nights':nights}
     result=add(selected)
+    # Distinguish guest payments (column O) from booking gross value (column X).
+    sum_o=sum((b['paid_guest'] for b,_ in selected if b['paid_guest'] is not None),Decimal('0'))
+    count_o=sum(b['paid_guest'] is not None for b,_ in selected)
+    sum_p=sum((b['cash_due'] for b,_ in selected if b['cash_due'] is not None),Decimal('0'))
+    count_p=sum(b['cash_due'] is not None for b,_ in selected)
+    # Solo differenza matematica, non pagamenti comprovati. Evitare doppi conteggi.
+    not_reconciled=result['revenue']-sum_o-sum_p
     prefix=f"Statistiche gestionali per {period}"+(f' · {room}' if room else '')
     lines=[prefix,
-        f"• Ricavi lordi (colonna X): {fmt_money(result['revenue']) if result['missing_gross'] < result['bookings'] or not result['bookings'] else 'non determinabili (colonna X vuota)'}",
+        f"• Ricavi lordi prenotazioni (colonna X): {fmt_money(result['revenue']) if result['missing_gross'] < result['bookings'] or not result['bookings'] else 'non determinabili (colonna X vuota)'}",
+        f"• Pagato anticipatamente / tramite OTA (colonna O): {fmt_money(sum_o)} su {count_o} righe valorizzate; per le prenotazioni dirette può essere già incassato da Janara",
+        f"• Cash previsto all'arrivo (colonna P): {fmt_money(sum_p)} su {count_p} righe valorizzate; non è prova di incasso effettivo",
+        f"• Differenza aritmetica X − O − P: {fmt_money(not_reconciled)} (da riconciliare, non una nuova modalità di pagamento)",
         f"• Check-in / soggiorni registrati: {result['bookings']}",
         f"• Ospiti indicati (colonna E): {result['guests']}",
         f"• Notti dei soggiorni: {result['nights']}"]
@@ -365,6 +375,15 @@ def stats_response(q,data=None):
     t=q.casefold()
     bymonth=(month is None and ('mese' in t or 'mensil' in t or 'anno' in t or 'fatturat' in t))
     byroom=(not room and any(w in t for w in ('camera','appartament','struttura','classifica','quale')))
+    if month is None and any(w in t for w in ('incassat','incassi','pagato','pagamenti','cash','contant')):
+        lines.append('Dettaglio ricavi lordi X e modalità O/P mese per mese:')
+        for m in range(1,13):
+            part=[b for b,ym in selected if ym[1]==m]
+            if part:
+                a=sum((b['paid_guest'] for b in part if b['paid_guest'] is not None),Decimal('0'))
+                c=sum((b['cash_due'] for b in part if b['cash_due'] is not None),Decimal('0'))
+                x=sum((b['gross'] for b in part if b['gross'] is not None),Decimal('0'))
+                lines.append(f'• {MONTHS_IT[m].capitalize()}: totale lordo X {fmt_money(x)}; già pagato O {fmt_money(a)}; cash previsto P {fmt_money(c)}; differenza X-O-P {fmt_money(x-a-c)}; {len(part)} registrazioni')
     if bymonth:
         lines.append('')
         lines.append('Dettaglio per mese (codice L):')
@@ -372,7 +391,9 @@ def stats_response(q,data=None):
             part=[(b,ym) for b,ym in selected if ym[1]==m]
             if part:
                 st=add(part)
-                lines.append(f"• {MONTHS_IT[m].capitalize()}: {fmt_money(st['revenue'])}; {st['bookings']} check-in; {st['guests']} ospiti; {st['nights']} notti"+(' (ricavi incompleti)' if st['missing_gross'] else ''))
+                pa=sum((b['paid_guest'] for b,_ in part if b['paid_guest'] is not None),Decimal('0'))
+                ca=sum((b['cash_due'] for b,_ in part if b['cash_due'] is not None),Decimal('0'))
+                lines.append(f"• {MONTHS_IT[m].capitalize()}: lordo X {fmt_money(st['revenue'])}; già pagato O {fmt_money(pa)}; cash previsto P {fmt_money(ca)}; {st['bookings']} check-in; {st['guests']} ospiti; {st['nights']} notti"+(' (ricavi incompleti)' if st['missing_gross'] else ''))
     if byroom:
         groups={}
         for b,ym in selected: groups.setdefault(b['room_key'] or '[camera non indicata]',[]).append((b,ym))
@@ -383,6 +404,7 @@ def stats_response(q,data=None):
             lines.append(f"• {key}: {fmt_money(st['revenue'])}; {st['bookings']} check-in; {st['guests']} ospiti; {st['nights']} notti"+(' (ricavi incompleti)' if st['missing_gross'] else ''))
     lines.append('')
     lines.append(f'Righe valide incluse nel periodo: {len(selected)} su {len(data)} registrazioni con nome e date interpretabili nel foglio.')
+    lines.append('Quando chiedi incassato/fatturato: totale gestionale = X, non O. Dettaglio: O già pagato dall’ospite (bonifico/OTA da verificare; nelle prenotazioni dirette può essere un incasso), P cash previsto. La colonna N può descrivere il metodo, ma da sola non comprova accrediti. La differenza X-O-P non è un incasso effettivo. Celle vuote non implicano zero.')
     lines.append('Metodo: mese della colonna L; un check-in per riga/soggiorno valido, date F/I; ricavi lordi X. I ricavi sono gestionali, non fatturato fiscale né accrediti bancari. Soggiorni a cavallo di due mesi attribuiti al mese L, senza ripartizione per notte.')
     return {'text':'\n'.join(lines),'source':'Google Sheet check IN JAnara · colonne L, X, E, F, I · calcolo Python'}
 
