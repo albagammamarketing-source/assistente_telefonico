@@ -500,14 +500,15 @@ def generate_neural_voice(body: VoiceRequest, _=Depends(auth)):
             headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'},
             json={
                 'model': os.getenv('JANARA_TTS_MODEL', 'gpt-4o-mini-tts'),
-                'voice': os.getenv('JANARA_TTS_VOICE', 'coral'),
+                'voice': os.getenv('JANARA_TTS_VOICE', 'marin'),
                 'input': spoken,
-                'instructions': ('Parla in italiano con voce calda, naturale e cordiale, '
-                                 'tono professionale da assistente reception. Usa pause brevi '
-                                 'e una cadenza fluida, pronuncia con chiarezza date, numeri '
-                                 'e importi in euro. Non aggiungere parole.'),
+                'instructions': ('Sei la voce femminile di Janara, assistente privata di reception. '
+                                 'Parla in italiano contemporaneo, con naturalezza, calma e calore. '
+                                 'Ritmo scorrevole, accenti espressivi, pause brevi dopo frasi complete. '
+                                 'Evita la cantilena e il tono da lettura di elenco; pronuncia bene '
+                                 'nomi italiani, date e importi. Non aggiungere informazioni.'),
                 'response_format': 'mp3',
-                'speed': 1.0,
+                'speed': float(os.getenv('JANARA_TTS_SPEED', '0.94')),
             },
             timeout=45,
         )
@@ -551,11 +552,32 @@ function stopSpeaking(){
  if('speechSynthesis' in window) window.speechSynthesis.cancel();
 }
 function voiceText(t){
- // Keep speech focused on a natural summary; full report stays visible as text.
- const plain=t.replace(/[*#_`]/g,'').replace(/\s+/g,' ').trim();
- if(plain.length<=2100)return plain;
- return plain.substring(0,1950).replace(/\s+\S*$/,'')+'. Il resto dei dettagli è disponibile nella risposta scritta.';
+ // Spoken summary is intentionally shorter than the written analytical report.
+ // Do not read markdown, long tables, raw sums, line numbers or technical source labels.
+ let lines=t.replace(/\r/g,'').split('\n').map(x=>x.trim()).filter(Boolean);
+ lines=lines.filter(x=>!/^fonte\s*:/i.test(x)&&!/^riga\s+\d+/i.test(x));
+ const monetary=(x)=>x.replace(/€\s*(\d+(?:[.,]\d+)?)/g,'$1 euro')
+    .replace(/(\d+(?:[.,]\d+)?)\s*€/g,'$1 euro');
+ const clean=x=>monetary(x.replace(/[*#_`|]/g,' ')
+    .replace(/^[-•]\s*/,'').replace(/\s+/g,' ').trim());
+ // Keep opening conclusion and at most 3 concise relevant details.
+ let kept=[];
+ for(const line of lines){
+   const piece=clean(line);
+   if(!piece || /^\d+\.\s*$/.test(piece))continue;
+   if(/^(?:totale\s+pagato\s*:.*[+=]|\d+(?:[.,]\d+)?\s*\+\s*\d+)/i.test(piece))continue;
+   kept.push(piece);
+   if(kept.length>=4)break;
+ }
+ let text=kept.join('. ').replace(/\.\s*\./g,'.');
+ if(text.length>650){
+    const cut=text.substring(0,650).lastIndexOf('. ');
+    text=text.substring(0,cut>180?cut:650);
+    text += '. I dettagli completi sono visibili sullo schermo.';
+ }
+ return text.trim();
 }
+
 async function speak(t){
  if(!speakBox.checked)return;
  stopSpeaking();const seq=audioSequence;
