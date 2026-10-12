@@ -241,7 +241,7 @@ def registry_context(q, data):
 
 
 SYSTEM_PROMPT = """Sei Janara AI, assistente gestionale PRIVATO per personale autorizzato.
-Rispondi in italiano in modo naturale, sintetico ma concreto, usando ESCLUSIVAMENTE i dati JSON forniti.
+Rispondi in italiano in modo ESTREMAMENTE CONCISO usando ESCLUSIVAMENTE i dati JSON forniti. Dai SOLO quanto richiesto, preferibilmente una frase e un numero. Non aggiungere dettagli, elenchi, saluti, spiegazioni, suggerimenti o riepiloghi non richiesti. Per una domanda di totale rispondi solo con il totale e il periodo.
 Non inventare persone, telefoni, importi, identità camera, prenotazioni o informazioni non presenti.
 Sono disponibili SOLO le righe di Google Sheet del registro manuale: NON hai ancora letto email Beddy,
 movimenti bancari, accrediti OTA o feed iCal in questo percorso AI.
@@ -324,89 +324,68 @@ def stats_room(q,data):
     return None
 
 
-def stats_response(q,data=None):
-    if data is None: data=read_registry()
-    year,month,period=stats_period(q)
-    room=stats_room(q,data)
-    selected=[]; fallback_count=0
+def stats_response(q, data=None):
+    """Calcoli completi, risposte minime e pertinenti alla domanda."""
+    if data is None: data = read_registry()
+    year, month, period = stats_period(q)
+    room = stats_room(q, data)
+    rows = []
     for b in data:
-        ym,origin=stats_month_key(b)
-        if ym[0] != year or (month is not None and ym[1]!=month): continue
-        if room and b['room_key']!=room: continue
-        selected.append((b,ym))
-        fallback_count+= origin=='F'
-    # Do not assume an empty E or X is zero. Also do not treat O as actual bank credit.
-    def add(rows):
-        items=[b for b,_ in rows]
-        present=[b['gross'] for b in items if b['gross'] is not None]
-        guest_values=[safe_guest_count(b['guests']) for b in items]
-        guests=sum(v for v in guest_values if v is not None)
-        nights=sum((b['departure']-b['arrival']).days for b in items)
-        return {'bookings':len(items),'revenue':sum(present,Decimal('0')),
-                'missing_gross':len(items)-len(present),
-                'guests':guests,'missing_guests':sum(v is None for v in guest_values),
-                'nights':nights}
-    result=add(selected)
-    # Distinguish guest payments (column O) from booking gross value (column X).
-    sum_o=sum((b['paid_guest'] for b,_ in selected if b['paid_guest'] is not None),Decimal('0'))
-    count_o=sum(b['paid_guest'] is not None for b,_ in selected)
-    sum_p=sum((b['cash_due'] for b,_ in selected if b['cash_due'] is not None),Decimal('0'))
-    count_p=sum(b['cash_due'] is not None for b,_ in selected)
-    # Solo differenza matematica, non pagamenti comprovati. Evitare doppi conteggi.
-    not_reconciled=result['revenue']-sum_o-sum_p
-    prefix=f"Statistiche gestionali per {period}"+(f' · {room}' if room else '')
-    lines=[prefix,
-        f"• Ricavi lordi prenotazioni (colonna X): {fmt_money(result['revenue']) if result['missing_gross'] < result['bookings'] or not result['bookings'] else 'non determinabili (colonna X vuota)'}",
-        f"• Pagato anticipatamente / tramite OTA (colonna O): {fmt_money(sum_o)} su {count_o} righe valorizzate; per le prenotazioni dirette può essere già incassato da Janara",
-        f"• Cash previsto all'arrivo (colonna P): {fmt_money(sum_p)} su {count_p} righe valorizzate; non è prova di incasso effettivo",
-        f"• Differenza aritmetica X − O − P: {fmt_money(not_reconciled)} (da riconciliare, non una nuova modalità di pagamento)",
-        f"• Check-in / soggiorni registrati: {result['bookings']}",
-        f"• Ospiti indicati (colonna E): {result['guests']}",
-        f"• Notti dei soggiorni: {result['nights']}"]
-    if any(b['arrival']==b['departure'] for b,_ in selected):
-        lines.append(f"Nota: {sum(b['arrival']==b['departure'] for b,_ in selected)} righe con arrivo=partenza conteggiate come registrazioni, ma con 0 notti. Da verificare se siano veri check-in.")
-    if result['missing_gross']:
-        lines.append(f"⚠ Importo X mancante in {result['missing_gross']} soggiorni: ricavi parziali.")
-    if result['missing_guests']:
-        lines.append(f"⚠ Numero ospiti E mancante/non valido in {result['missing_guests']} soggiorni: totale ospiti parziale.")
-    if fallback_count:
-        lines.append(f"Nota: per {fallback_count} soggiorni il codice mese in L è assente/non valido; utilizzata la data arrivo F.")
-    # Breakdown automatically if year was requested, or by room/month requested.
-    t=q.casefold()
-    bymonth=(month is None and ('mese' in t or 'mensil' in t or 'anno' in t or 'fatturat' in t))
-    byroom=(not room and any(w in t for w in ('camera','appartament','struttura','classifica','quale')))
-    if month is None and any(w in t for w in ('incassat','incassi','pagato','pagamenti','cash','contant')):
-        lines.append('Dettaglio ricavi lordi X e modalità O/P mese per mese:')
-        for m in range(1,13):
-            part=[b for b,ym in selected if ym[1]==m]
-            if part:
-                a=sum((b['paid_guest'] for b in part if b['paid_guest'] is not None),Decimal('0'))
-                c=sum((b['cash_due'] for b in part if b['cash_due'] is not None),Decimal('0'))
-                x=sum((b['gross'] for b in part if b['gross'] is not None),Decimal('0'))
-                lines.append(f'• {MONTHS_IT[m].capitalize()}: totale lordo X {fmt_money(x)}; già pagato O {fmt_money(a)}; cash previsto P {fmt_money(c)}; differenza X-O-P {fmt_money(x-a-c)}; {len(part)} registrazioni')
-    if bymonth:
-        lines.append('')
-        lines.append('Dettaglio per mese (codice L):')
-        for m in range(1,13):
-            part=[(b,ym) for b,ym in selected if ym[1]==m]
-            if part:
-                st=add(part)
-                pa=sum((b['paid_guest'] for b,_ in part if b['paid_guest'] is not None),Decimal('0'))
-                ca=sum((b['cash_due'] for b,_ in part if b['cash_due'] is not None),Decimal('0'))
-                lines.append(f"• {MONTHS_IT[m].capitalize()}: lordo X {fmt_money(st['revenue'])}; già pagato O {fmt_money(pa)}; cash previsto P {fmt_money(ca)}; {st['bookings']} check-in; {st['guests']} ospiti; {st['nights']} notti"+(' (ricavi incompleti)' if st['missing_gross'] else ''))
-    if byroom:
+        ym, _ = stats_month_key(b)
+        if ym[0] != year or (month is not None and ym[1] != month): continue
+        if room and b['room_key'] != room: continue
+        rows.append((b, ym))
+    qn = norm(q)
+    def sums(part):
+        entries = [b for b, _ in part]
+        return {
+            'x': sum((b['gross'] for b in entries if b['gross'] is not None), Decimal('0')),
+            'o': sum((b['paid_guest'] for b in entries if b['paid_guest'] is not None), Decimal('0')),
+            'p': sum((b['cash_due'] for b in entries if b['cash_due'] is not None), Decimal('0')),
+            'checkin': len(entries),
+            'ospiti': sum((v for b in entries if (v := safe_guest_count(b['guests'])) is not None), 0),
+            'notti': sum((b['departure'] - b['arrival']).days for b in entries),
+            'missing_x': sum(b['gross'] is None for b in entries),
+            'missing_ospiti': sum(safe_guest_count(b['guests']) is None for b in entries),
+        }
+    totals = sums(rows)
+    split = any(x in qn for x in ('dettaglio', 'distinzion', 'suddivid', 'ripart', 'separat', 'bonific', 'contant', 'cash', 'colonna o', 'colonna p'))
+    monthly = any(x in qn for x in ('mese per mese', 'per mese', 'mensil', 'ogni mese'))
+    per_room = not room and any(x in qn for x in ('per camera', 'per appartament', 'ogni camera', 'ogni appartament', 'classifica', 'quale appartament'))
+    wants_guests = any(x in qn for x in ('ospiti', 'persone'))
+    wants_checkin = any(x in qn for x in ('check in', 'check-in', 'soggiorn', 'prenotazioni', 'arrivi'))
+    wants_nights = any(x in qn for x in ('notti', 'pernottament'))
+    wants_cash_only = any(x in qn for x in ('quanto cash', 'quanto contant', 'cash da riscuotere', 'contanti da riscuotere'))
+    wants_paid_only = any(x in qn for x in ('quanto gia pagato', 'quanto pagato', 'colonna o')) and not split
+    wants_gross = any(x in qn for x in ('fatturat', 'ricav', 'incassat', 'incassi', 'guadagn', 'lordo', 'vendite', 'totale'))
+    if not rows:
+        return {'text': f'Nessuna prenotazione trovata per {period}' + (f' · {room}' if room else '') + '.', 'source': 'Google Sheet · calcolo Python'}
+    def concise(t, scope):
+        if wants_cash_only: return f'Cash previsto {scope}: {fmt_money(t["p"])}.'
+        if wants_paid_only: return f'Pagato dagli ospiti {scope}: {fmt_money(t["o"])}.'
+        if wants_guests and not wants_gross and not split: return f'Ospiti {scope}: {t["ospiti"]}.'
+        if wants_checkin and not wants_gross and not split: return f'Check-in {scope}: {t["checkin"]}.'
+        if wants_nights and not wants_gross and not split: return f'Notti {scope}: {t["notti"]}.'
+        line = f'Ricavi lordi {scope}: {fmt_money(t["x"])}.'
+        if split:
+            line += f' Pagato dagli ospiti (O): {fmt_money(t["o"])}; cash previsto (P): {fmt_money(t["p"])}.'
+        return line
+    scope=period + (f' · {room}' if room else '')
+    if monthly and month is None:
+        lines=[concise(sums([(b,ym) for b,ym in rows if ym[1]==m]), f'{MONTHS_IT[m]} {year}')
+               for m in range(1,13) if any(ym[1]==m for _,ym in rows)]
+    elif per_room:
         groups={}
-        for b,ym in selected: groups.setdefault(b['room_key'] or '[camera non indicata]',[]).append((b,ym))
-        lines.append('')
-        lines.append('Dettaglio per camera:')
-        for key,rows in sorted(groups.items(),key=lambda x:add(x[1])['revenue'],reverse=True):
-            st=add(rows)
-            lines.append(f"• {key}: {fmt_money(st['revenue'])}; {st['bookings']} check-in; {st['guests']} ospiti; {st['nights']} notti"+(' (ricavi incompleti)' if st['missing_gross'] else ''))
-    lines.append('')
-    lines.append(f'Righe valide incluse nel periodo: {len(selected)} su {len(data)} registrazioni con nome e date interpretabili nel foglio.')
-    lines.append('Quando chiedi incassato/fatturato: totale gestionale = X, non O. Dettaglio: O già pagato dall’ospite (bonifico/OTA da verificare; nelle prenotazioni dirette può essere un incasso), P cash previsto. La colonna N può descrivere il metodo, ma da sola non comprova accrediti. La differenza X-O-P non è un incasso effettivo. Celle vuote non implicano zero.')
-    lines.append('Metodo: mese della colonna L; un check-in per riga/soggiorno valido, date F/I; ricavi lordi X. I ricavi sono gestionali, non fatturato fiscale né accrediti bancari. Soggiorni a cavallo di due mesi attribuiti al mese L, senza ripartizione per notte.')
-    return {'text':'\n'.join(lines),'source':'Google Sheet check IN JAnara · colonne L, X, E, F, I · calcolo Python'}
+        for b,ym in rows: groups.setdefault(b['room_key'] or 'camera non indicata', []).append((b,ym))
+        lines=[concise(sums(group), f'{scope} · {name}') for name,group in
+               sorted(groups.items(), key=lambda kv:sums(kv[1])['x'],reverse=True)]
+    else:
+        lines=[concise(totals,scope)]
+    if totals['missing_x'] and (wants_gross or split or (not wants_guests and not wants_checkin and not wants_nights)):
+        lines.append(f'Attenzione: {totals["missing_x"]} prenotazioni senza importo X; totale parziale.')
+    if wants_guests and totals['missing_ospiti']:
+        lines.append(f'Ospiti non indicati in {totals["missing_ospiti"]} prenotazioni.')
+    return {'text': '\n'.join(lines), 'source': 'Google Sheet · calcolo Python'}
 
 
 def safe_guest_count(v):
@@ -442,23 +421,19 @@ def exact_operational_answer(q):
     if is_arrival: matches=[b for b in data if b['arrival']==target]
     elif is_departure: matches=[b for b in data if b['departure']==target]
     else: matches=[b for b in data if b['arrival']==target]
-    title='Arrivi' if is_arrival else 'Partenze' if is_departure else 'Arrivi con saldo cash'
-    lines=[f'{title} del {target:%d/%m/%Y}: {len(matches)} registrazioni.']
-    for b in matches:
-        cash=b['cash_due']
-        lines.append(f"• {b['name']} — {b['room'] or 'CAMERA DA VERIFICARE'}; "
-                     f"arrivo {b['arrival']:%d/%m/%Y}, partenza {b['departure']:%d/%m/%Y}; "
-                     f"ospiti {b['guests'] or 'non indicati'}; "
-                     f"pagato ospite (O) {fmt_money(b['paid_guest'])}; "
-                     f"cash da riscuotere (P) {fmt_money(cash)}; "
-                     f"riga {b['row']}")
-        if b['arrival']==b['departure']:
-            lines.append(f"  ⚠ Riga {b['row']}: check-in e check-out coincidono (0 notti); da verificare.")
-    if is_cash or is_arrival:
-        cash_known=[b['cash_due'] for b in matches if b['cash_due'] is not None]
-        lines.append(f"Totale cash P indicato: {fmt_money(sum(cash_known,Decimal('0')))}.")
-        if len(cash_known)<len(matches): lines.append(f"Nota: colonna P vuota in {len(matches)-len(cash_known)} righe; non interpretata automaticamente come saldo zero.")
-    lines.append("Fonte: registro Janara, filtrato per data esatta. Nessun ospite di altre date è incluso.")
+    title='Arrivi' if is_arrival else 'Partenze' if is_departure else 'Cash previsto'
+    wants_detail=any(w in low for w in ('nome','nomi','elenco','dettaglio','chi ', 'camera','telefono', 'ospiti'))
+    if is_cash and not wants_detail:
+        value=sum((b['cash_due'] for b in matches if b['cash_due'] is not None), Decimal('0'))
+        lines=[f'Cash previsto il {target:%d/%m/%Y}: {fmt_money(value)}.']
+    else:
+        lines=[f'{title} del {target:%d/%m/%Y}: {len(matches)}.']
+        if wants_detail:
+            for b in matches:
+                piece=f"• {b['name']} — {b['room'] or 'camera non indicata'}"
+                if 'telefono' in low: piece+=f" — {b.get('phone') or 'telefono non indicato'}"
+                if 'cash' in low or 'contant' in low: piece+=f" — cash {fmt_money(b['cash_due'])}"
+                lines.append(piece)
     return {'text':'\n'.join(lines),'source':'Google Sheet check IN JAnara · date F/I, O, P · calcolo Python'}
 
 
