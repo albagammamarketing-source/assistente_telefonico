@@ -179,7 +179,7 @@ def answer(q):
                 if not taken: ok+=1
             except Exception:
                 lines.append(f'• {name}: NON VERIFICABILE (feed non accessibile)'); errors+=1
-        return {'text':f"Situazione per la notte del {when:%d/%m/%Y}: {ok} camere senza blocco iCal rilevato, {errors} calendari non verificabili.\\n" + '\\n'.join(lines)+"\\nNota: iCal indica disponibilità/blocchi, non identifica necessariamente l'ospite. Prima di confermare una vendita serve controllo aggiornato Beddy.",'source':'iCal Beddy da CAMERE_CONFIG'}
+        return {'text':f"Situazione per la notte del {when:%d/%m/%Y}: {ok} camere senza blocco iCal rilevato, {errors} calendari non verificabili.\\n" + '\n'.join(lines)+"\\nNota: iCal indica disponibilità/blocchi, non identifica necessariamente l'ospite. Prima di confermare una vendita serve controllo aggiornato Beddy.",'source':'iCal Beddy da CAMERE_CONFIG'}
     if any(w in query for w in ('anomali','mancant','differenz','verific')):
         matches=[b for b in data if today-timedelta(days=3)<=b['arrival']<=today+timedelta(days=45) and not b['room']]
         return {'text':f"Prenotazioni senza camera nel registro (arrivi tra {today-timedelta(days=3):%d/%m/%Y} e {today+timedelta(days=45):%d/%m/%Y}): {len(matches)}.\\n" + '\\n'.join('• '+bformat(b) for b in matches[:30]) + "\\nPer confrontare anche le conferme email Beddy occorre integrare un accesso Gmail server-side in sola lettura.",'source':'Google Sheet registro; controllo parziale'}
@@ -394,10 +394,59 @@ def safe_guest_count(v):
     except (ValueError,TypeError): return None
 
 
+def exact_operational_answer(q):
+    """Answer date-scoped arrival/departure/cash questions deterministically.
+    Return None for questions that need the model or statistical engine.
+    """
+    low=q.casefold()
+    is_arrival=any(w in low for w in ('arriv', 'check-in','check in'))
+    is_departure=any(w in low for w in ('partenz', 'parton', 'check-out','check out'))
+    is_cash=any(w in low for w in ('cash','contant','riscuotere'))
+    # Aggregations belong to the statistical calculation, not this detailed roster.
+    if (stats_request(q) and not (any(x in low for x in ('oggi','domani','dopodomani')) and (is_arrival or is_departure))) or not (is_arrival or is_departure or is_cash):
+        return None
+    # Avoid silently interpreting a generic room/guest question as "today".
+    has_date=bool(re.search(r'\b(?:20\d{2}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/20\d{2})\b',q))
+    has_relative=any(w in low for w in ('oggi','domani','dopodomani'))
+    target=requested_date(q)
+    # Support conversational Italian dates like "12 ottobre 2026".
+    parsed=re.search(r'\b(\d{1,2})\s+('+ '|'.join(MONTHS_IT[1:])+r')\s+(20\d{2})\b',low)
+    if parsed:
+        try: target=date(int(parsed.group(3)),MONTHS_IT.index(parsed.group(2)),int(parsed.group(1))); has_date=True
+        except ValueError: return {'text':'Data richiesta non valida.','source':'Controllo date'}
+    if not (has_date or has_relative):
+        return None
+    data=read_registry()
+    if is_arrival: matches=[b for b in data if b['arrival']==target]
+    elif is_departure: matches=[b for b in data if b['departure']==target]
+    else: matches=[b for b in data if b['arrival']==target]
+    title='Arrivi' if is_arrival else 'Partenze' if is_departure else 'Arrivi con saldo cash'
+    lines=[f'{title} del {target:%d/%m/%Y}: {len(matches)} registrazioni.']
+    for b in matches:
+        cash=b['cash_due']
+        lines.append(f"• {b['name']} — {b['room'] or 'CAMERA DA VERIFICARE'}; "
+                     f"arrivo {b['arrival']:%d/%m/%Y}, partenza {b['departure']:%d/%m/%Y}; "
+                     f"ospiti {b['guests'] or 'non indicati'}; "
+                     f"pagato ospite (O) {fmt_money(b['paid_guest'])}; "
+                     f"cash da riscuotere (P) {fmt_money(cash)}; "
+                     f"riga {b['row']}")
+        if b['arrival']==b['departure']:
+            lines.append(f"  ⚠ Riga {b['row']}: check-in e check-out coincidono (0 notti); da verificare.")
+    if is_cash or is_arrival:
+        cash_known=[b['cash_due'] for b in matches if b['cash_due'] is not None]
+        lines.append(f"Totale cash P indicato: {fmt_money(sum(cash_known,Decimal('0')))}.")
+        if len(cash_known)<len(matches): lines.append(f"Nota: colonna P vuota in {len(matches)-len(cash_known)} righe; non interpretata automaticamente come saldo zero.")
+    lines.append("Fonte: registro Janara, filtrato per data esatta. Nessun ospite di altre date è incluso.")
+    return {'text':'\n'.join(lines),'source':'Google Sheet check IN JAnara · date F/I, O, P · calcolo Python'}
+
+
 def ai_answer(q):
     """Use the OpenAI model for free-form read-only Q&A, fall back on known commands."""
-    if stats_request(q):
+    if stats_request(q) and not (any(x in q.casefold() for x in ('oggi','domani','dopodomani')) and any(x in q.casefold() for x in ('arriv','parten','check-in','check in'))):
         return stats_response(q)
+    exact = exact_operational_answer(q)
+    if exact is not None:
+        return exact
     # Richieste quantitative storiche: calcolo su tutto il registro, mai sul contesto AI ridotto.
     qlow=q.casefold()
     if re.search(r'\b(20\d{2}|0?[1-9]_[0-9]{2}|1[0-2]_[0-9]{2})\b',qlow) and any(w in qlow for w in ('quanto','quanti','quante','totale','somma','conteggio','numero','media')) and any(w in qlow for w in ('euro','sold','import','guadagn','incass','prenot','soggiorn','ospit','arriv','check','nott','camera','appartament')):
