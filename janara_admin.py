@@ -11,7 +11,7 @@ from urllib.parse import quote
 
 import requests
 from fastapi import APIRouter, HTTPException, Depends
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from google.oauth2 import service_account
@@ -481,6 +481,43 @@ class ChatRequest(BaseModel):
     message: str
 
 
+class VoiceRequest(BaseModel):
+    text: str
+
+
+@router.post('/tts')
+def generate_neural_voice(body: VoiceRequest, _=Depends(auth)):
+    """Authenticated TTS; no keys are sent to the client; does not modify booking data."""
+    key = os.getenv('OPENAI_API_KEY', '').strip()
+    if not key:
+        raise HTTPException(status_code=503, detail='OPENAI_API_KEY non configurata su Render')
+    spoken = re.sub(r'[*#_`]+', '', body.text or '').strip()
+    if not spoken or len(spoken) > 2400:
+        raise HTTPException(status_code=400, detail='Testo vocale assente o troppo lungo (massimo 2400 caratteri)')
+    try:
+        upstream = requests.post(
+            'https://api.openai.com/v1/audio/speech',
+            headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'},
+            json={
+                'model': os.getenv('JANARA_TTS_MODEL', 'gpt-4o-mini-tts'),
+                'voice': os.getenv('JANARA_TTS_VOICE', 'coral'),
+                'input': spoken,
+                'instructions': ('Parla in italiano con voce calda, naturale e cordiale, '
+                                 'tono professionale da assistente reception. Usa pause brevi '
+                                 'e una cadenza fluida, pronuncia con chiarezza date, numeri '
+                                 'e importi in euro. Non aggiungere parole.'),
+                'response_format': 'mp3',
+                'speed': 1.0,
+            },
+            timeout=45,
+        )
+        upstream.raise_for_status()
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail='Servizio vocale OpenAI temporaneamente non disponibile') from None
+    return Response(content=upstream.content, media_type='audio/mpeg',
+                    headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'})
+
+
 HTML = r'''<!doctype html>
 <html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Janara AI · Reception</title>
@@ -502,11 +539,40 @@ const micBtn=document.querySelector('#mic');
 const speakBox=document.querySelector('#speak');
 const stopBtn=document.querySelector('#stopvoice');
 const status=document.querySelector('#status');
-let busy=false, listening=false, rec=null;
+let busy=false, listening=false, rec=null, currentAudio=null, currentAudioUrl=null, voiceRequest=null;
+let audioSequence=0;
 function add(t,k){const d=document.createElement('div');d.className='m '+k;d.textContent=t;box.appendChild(d);d.scrollIntoView({block:'end',behavior:'smooth'});}
 function setStatus(t){status.textContent=t;}
-function stopSpeaking(){if('speechSynthesis' in window) window.speechSynthesis.cancel();}
-function speak(t){if(!speakBox.checked||!('speechSynthesis' in window))return;stopSpeaking();const u=new SpeechSynthesisUtterance(t);u.lang='it-IT';u.rate=1;window.speechSynthesis.speak(u);}
+function stopSpeaking(){
+ audioSequence++;
+ if(voiceRequest){voiceRequest.abort();voiceRequest=null;}
+ if(currentAudio){currentAudio.pause();currentAudio.src='';currentAudio=null;}
+ if(currentAudioUrl){URL.revokeObjectURL(currentAudioUrl);currentAudioUrl=null;}
+ if('speechSynthesis' in window) window.speechSynthesis.cancel();
+}
+function voiceText(t){
+ // Keep speech focused on a natural summary; full report stays visible as text.
+ const plain=t.replace(/[*#_`]/g,'').replace(/\s+/g,' ').trim();
+ if(plain.length<=2100)return plain;
+ return plain.substring(0,1950).replace(/\s+\S*$/,'')+'. Il resto dei dettagli è disponibile nella risposta scritta.';
+}
+async function speak(t){
+ if(!speakBox.checked)return;
+ stopSpeaking();const seq=audioSequence;
+ const controller=new AbortController();voiceRequest=controller;
+ setStatus('Preparo la risposta vocale...');
+ try{
+  const r=await fetch('/admin-janara/tts',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({text:voiceText(t)}),signal:controller.signal});
+  if(!r.ok)throw new Error('HTTP '+r.status);
+  const blob=await r.blob();if(seq!==audioSequence||!speakBox.checked)return;
+  const url=URL.createObjectURL(blob);currentAudioUrl=url;
+  const audio=new Audio(url);currentAudio=audio;
+  audio.onended=()=>{if(seq===audioSequence){setStatus('Risposta completata');stopSpeaking();}};
+  audio.onerror=()=>{if(seq===audioSequence){setStatus('Errore di riproduzione audio');stopSpeaking();}};
+  setStatus('Janara sta parlando...');await audio.play();
+ }catch(e){if(e.name!=='AbortError'&&seq===audioSequence){setStatus('Audio neurale non disponibile: la risposta scritta resta consultabile.');}}
+ finally{if(voiceRequest===controller)voiceRequest=null;}
+}
 async function sendQuestion(q){q=(q||'').trim();if(!q||busy)return;busy=true;sendBtn.disabled=true;micBtn.disabled=true;inp.value='';stopSpeaking();add(q,'m');setStatus('Sto cercando le informazioni...');try{const r=await fetch('/admin-janara/ask',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({message:q})});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();const answer=d.answer||'Nessuna risposta disponibile';add(answer+'\n\nFonte: '+(d.source||'non indicata'),'a');setStatus('Risposta ricevuta');speak(answer);}catch(e){add('Impossibile recuperare i dati: '+e.message,'a');setStatus('Errore nel recupero dei dati');}finally{busy=false;sendBtn.disabled=false;micBtn.disabled=false;}}
 form.addEventListener('submit',e=>{e.preventDefault();sendQuestion(inp.value);});
 const Recognition=window.SpeechRecognition||window.webkitSpeechRecognition;
