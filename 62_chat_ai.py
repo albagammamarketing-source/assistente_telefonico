@@ -28,6 +28,8 @@ except Exception:
 
 
 app = FastAPI(title="Janara Reception API")
+from janara_admin import router as janara_admin_router
+app.include_router(janara_admin_router)
 
 
 # =========================
