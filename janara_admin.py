@@ -185,8 +185,47 @@ class ChatRequest(BaseModel):
     message: str
 
 
-HTML = '''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Janara AI · Gestionale</title><style>body{margin:0;font:16px system-ui;background:#f3f5f8;color:#17212d}main{max-width:790px;margin:0 auto;padding:24px}h1{margin:0 0 4px}.hint{color:#667586;font-size:13px}.chat{margin:20px 0;min-height:250px;background:white;border-radius:16px;padding:20px;box-shadow:0 4px 20px #0001;white-space:pre-wrap}.m{padding:12px 15px;margin:10px 0;border-radius:12px;background:#eaf1ff}.a{background:#f2f5f8}form{display:flex;gap:8px}input{flex:1;padding:14px;border:1px solid #ccd3de;border-radius:10px;font:inherit;min-width:0}button{background:#173a62;color:white;border:0;border-radius:10px;padding:12px 20px;font:inherit;cursor:pointer}small{color:#6e7d8c}</style></head><body><main><h1>Janara AI · Reception</h1><div class="hint">Chat gestionale privata · fonti in sola lettura</div><div id="chat" class="chat"><div class="a m">Benvenuto. Chiedimi chi arriva oggi, quanto cash va riscosso o quali camere sono libere in una data.</div></div><form id="f"><input id="q" placeholder="Scrivi una domanda..." maxlength="1000" autocomplete="off" required><button>Invia</button></form><p><small>Le risposte dipendono dall'aggiornamento delle fonti. Nessuna modifica automatica alle prenotazioni.</small></p></main><script>const box=document.querySelector('#chat'),form=document.querySelector('#f'),inp=document.querySelector('#q');function add(t,k){const d=document.createElement('div');d.className='m '+k;d.textContent=t;box.appendChild(d);d.scrollIntoView({block:'end'});}form.addEventListener('submit',async e=>{e.preventDefault();const q=inp.value.trim();if(!q)return;inp.value='';add(q,'m');try{const r=await fetch('/admin-janara/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:q})});if(!r.ok)throw Error('HTTP '+r.status);const d=await r.json();add(d.answer+'\\n\\nFonte: '+d.source,'a');}catch(e){add('Impossibile recuperare i dati: '+e.message,'a');}});</script></body></html>'''
-
+HTML = r'''<!doctype html>
+<html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Janara AI · Reception</title>
+<style>
+body{margin:0;font:16px system-ui,sans-serif;background:#f3f5f8;color:#17212d}main{max-width:790px;margin:0 auto;padding:20px}h1{margin:0 0 4px}.hint{color:#667586;font-size:13px}.chat{margin:18px 0;min-height:220px;background:white;border-radius:16px;padding:20px;box-shadow:0 4px 20px #0001;white-space:pre-wrap}.m{padding:12px 15px;margin:10px 0;border-radius:12px;background:#eaf1ff;overflow-wrap:anywhere}.a{background:#f2f5f8}form{display:flex;gap:8px;flex-wrap:wrap}input{flex:1;min-width:150px;padding:14px;border:1px solid #ccd3de;border-radius:10px;font:inherit}button{background:#173a62;color:white;border:0;border-radius:10px;padding:12px 17px;font:inherit;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}button.secondary{background:#dde6f0;color:#173a62}.mic.on{background:#b32937}small{color:#6e7d8c}.tools{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px}.status{font-size:13px;color:#526478}label{font-size:14px}input[type=checkbox]{min-width:0;vertical-align:middle}button:focus-visible,input:focus-visible{outline:3px solid #5f95d6;outline-offset:2px}
+</style></head><body><main>
+<h1>Janara AI · Reception</h1><div class="hint">Chat gestionale privata · fonti in sola lettura</div>
+<div id="chat" class="chat" role="log" aria-live="polite"><div class="a m">Benvenuto. Chiedimi chi arriva oggi, quanto cash va riscosso o quali camere sono libere in una data.</div></div>
+<form id="f"><input id="q" aria-label="Domanda" placeholder="Scrivi una domanda oppure usa il microfono..." maxlength="1000" autocomplete="off" required><button id="send" type="submit">Invia</button><button id="mic" type="button" class="secondary mic" aria-pressed="false" aria-label="Avvia dettatura">🎤 Parla</button></form>
+<div class="tools"><label><input id="speak" type="checkbox"> Leggi le risposte ad alta voce</label><button id="stopvoice" type="button" class="secondary">■ Ferma voce</button><span id="status" class="status" role="status"></span></div>
+<p><small>Per usare il microfono, autorizza l'accesso quando richiesto dal browser. Il riconoscimento vocale dipende dal browser e potrebbe usare un servizio esterno. Evita l'ascolto delle risposte con dati degli ospiti in luoghi pubblici. Nessuna modifica automatica alle prenotazioni.</small></p>
+</main><script>
+'use strict';
+const box=document.querySelector('#chat');
+const form=document.querySelector('#f');
+const inp=document.querySelector('#q');
+const sendBtn=document.querySelector('#send');
+const micBtn=document.querySelector('#mic');
+const speakBox=document.querySelector('#speak');
+const stopBtn=document.querySelector('#stopvoice');
+const status=document.querySelector('#status');
+let busy=false, listening=false, rec=null;
+function add(t,k){const d=document.createElement('div');d.className='m '+k;d.textContent=t;box.appendChild(d);d.scrollIntoView({block:'end',behavior:'smooth'});}
+function setStatus(t){status.textContent=t;}
+function stopSpeaking(){if('speechSynthesis' in window) window.speechSynthesis.cancel();}
+function speak(t){if(!speakBox.checked||!('speechSynthesis' in window))return;stopSpeaking();const u=new SpeechSynthesisUtterance(t);u.lang='it-IT';u.rate=1;window.speechSynthesis.speak(u);}
+async function sendQuestion(q){q=(q||'').trim();if(!q||busy)return;busy=true;sendBtn.disabled=true;micBtn.disabled=true;inp.value='';stopSpeaking();add(q,'m');setStatus('Sto cercando le informazioni...');try{const r=await fetch('/admin-janara/ask',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({message:q})});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();const answer=d.answer||'Nessuna risposta disponibile';add(answer+'\n\nFonte: '+(d.source||'non indicata'),'a');setStatus('Risposta ricevuta');speak(answer);}catch(e){add('Impossibile recuperare i dati: '+e.message,'a');setStatus('Errore nel recupero dei dati');}finally{busy=false;sendBtn.disabled=false;micBtn.disabled=false;}}
+form.addEventListener('submit',e=>{e.preventDefault();sendQuestion(inp.value);});
+const Recognition=window.SpeechRecognition||window.webkitSpeechRecognition;
+if(!Recognition){micBtn.disabled=true;micBtn.title='Riconoscimento vocale non supportato da questo browser';setStatus('Microfono non supportato: prova Chrome o Edge aggiornati, oppure scrivi.');}
+else{
+ rec=new Recognition();rec.lang='it-IT';rec.continuous=false;rec.interimResults=false;rec.maxAlternatives=1;
+ rec.onstart=()=>{listening=true;micBtn.classList.add('on');micBtn.setAttribute('aria-pressed','true');micBtn.textContent='■ Stop';setStatus('Ti ascolto...');};
+ rec.onresult=e=>{const t=e.results?.[0]?.[0]?.transcript?.trim()||'';if(t){inp.value=t;setStatus('Domanda riconosciuta');}};
+ rec.onerror=e=>{setStatus(e.error==='not-allowed'?'Accesso al microfono negato: abilitalo nelle impostazioni del browser.':'Microfono: '+e.error);};
+ rec.onend=()=>{listening=false;micBtn.classList.remove('on');micBtn.setAttribute('aria-pressed','false');micBtn.textContent='🎤 Parla';if(inp.value.trim()&&!busy){const q=inp.value.trim();sendQuestion(q);}};
+ micBtn.addEventListener('click',()=>{if(listening){rec.stop();return;}if(busy)return;inp.value='';stopSpeaking();try{rec.start();}catch(e){setStatus('Impossibile avviare il microfono: '+e.message);}});
+}
+stopBtn.addEventListener('click',stopSpeaking);
+speakBox.addEventListener('change',()=>{if(!speakBox.checked)stopSpeaking();});
+</script></body></html>'''
 
 @router.get('/', response_class=HTMLResponse)
 def index(_=Depends(auth)):
