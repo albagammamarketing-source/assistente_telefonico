@@ -6,7 +6,7 @@ import re
 import base64
 from xml.sax.saxutils import escape
 from urllib.parse import parse_qs
-from janara_guest_lookup import recognize_guest
+from janara_guest_lookup import extract_booking_id, recognize_guest
 from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
@@ -1970,13 +1970,15 @@ def annotate_whatsapp_guest_session(from_number: str, incoming_message: str):
     """Solo classificazione; NON cambia il flusso esistente delle prenotazioni."""
     if not JANARA_GUEST_RECOGNITION_ENABLED:
         return
+    session = get_whatsapp_session(from_number)
+    # Ricorda l'ID gia' verificato nel dialogo; un nuovo ID esplicito prevale.
+    booking_hint = extract_booking_id(incoming_message) or session.get("guest_booking_id", "")
     try:
-        found = recognize_guest(get_janara_guest_snapshot(), from_number, incoming_message)
+        found = recognize_guest(get_janara_guest_snapshot(), from_number, booking_hint)
     except Exception as error:
         # Fallimento Google Sheets: prenotazioni esistenti continuano a funzionare.
         print(f"Riconoscimento ospite Janara non disponibile: {type(error).__name__}")
         return
-    session = get_whatsapp_session(from_number)
     session["guest_identity_status"] = found["status"]
     session["guest_booking_id"] = found.get("booking_id", "")
     session["guest_room"] = found.get("room", "")
