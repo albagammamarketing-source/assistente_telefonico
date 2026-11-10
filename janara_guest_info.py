@@ -84,6 +84,5 @@ def guest_room_directions(room):
         "STEP 1 - POSIZIONE GOOGLE MAPS\n"
         f"Ecco l'indirizzo della tua struttura: {address}.\n"
         f"Apri la posizione su Google Maps: {maps_url}\n"
-        "Quando hai visualizzato la posizione scrivimi 'POSIZIONE OK'. "
-        "Ti guidero' al passaggio successivo."
+        "Questo e' il primo passaggio. Le istruzioni successive saranno inviate separatamente."
     )
