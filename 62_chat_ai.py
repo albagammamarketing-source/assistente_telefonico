@@ -1991,31 +1991,73 @@ def annotate_whatsapp_guest_session(from_number: str, incoming_message: str):
 
 
 def guest_stay_reply(guest: dict, incoming_message: str) -> str:
-    """Risposta separata per ospiti riconosciuti, senza inventare informazioni."""
-    name = (guest.get("name") or "").strip()
+    """Risposte per ospiti gia' verificati, usando solo informazioni disponibili."""
     room = (guest.get("room") or "").strip()
     checkin = (guest.get("arrival") or "").strip()
     checkout = (guest.get("departure") or "").strip()
     booking_id = (guest.get("booking_id") or "").strip()
     lower = (incoming_message or "").strip().lower()
-    if any(word in lower for word in ("nuova prenotazione", "vorrei prenotare", "prenotare un altro", "altro appartamento")):
-        return ""  # Richiesta esplicita di nuova prenotazione: usa il flusso esistente.
-    stay = f"Ho trovato la tua prenotazione Janara {booking_id}"
-    if room:
-        stay += f" per l'appartamento {room}"
-    stay += "."
-    if any(word in lower for word in ("conferm", "quando", "date", "data", "check-in", "check in", "check-out", "check out", "arrivo", "partenza")):
-        if checkin:
-            stay += f"\nCheck-in: {checkin}."
-        if checkout:
-            stay += f"\nCheck-out: {checkout}."
-        stay += "\nPer orari e istruzioni di accesso specifiche serve la conferma dello staff Janara."
-        return stay
+
+    if any(x in lower for x in (
+        "nuova prenotazione", "vorrei prenotare", "prenotare un altro",
+        "altro appartamento", "nuovo soggiorno"
+    )):
+        return ""  # Rispetta l'intenzione esplicita di prenotare.
+
+    if any(x in lower for x in ("orario", "a che ora", "che ora", "ora del", "ora di")) and any(
+        x in lower for x in ("check", "arriv", "partenz", "entrare", "uscire", "accesso")
+    ):
+        return (
+            f"Per la prenotazione {booking_id} il check-in e' previsto il {checkin or 'giorno da confermare'}"
+            + (f" e il check-out il {checkout}" if checkout else "")
+            + ". L'orario preciso non e' indicato nei dati a mia disposizione. "
+              "Per confermare l'orario e le istruzioni di accesso serve lo staff Janara."
+        )
+
+    if any(x in lower for x in ("indicaz", "arrivare", "come raggiung", "indirizz", "dove si trova", "dove siete", "mappa")):
+        return (
+            f"Per l'appartamento {room or 'Janara'} non ho ancora un indirizzo verificato "
+            "da comunicarti. Per evitare indicazioni sbagliate, chiedi allo staff Janara "
+            "la posizione esatta e le istruzioni di accesso."
+        )
+
+    if any(x in lower for x in ("numero", "telefono", "contatt", "chiamare", "assistenza", "staff")):
+        return (
+            "Stai scrivendo al WhatsApp Janara 08241910020. "
+            "Non ho un altro recapito verificato dello staff da indicarti."
+        )
+
+    if any(x in lower for x in ("wifi", "wi-fi", "password", "parchegg", "chiavi", "codice porta", "accesso")):
+        return (
+            f"Ho identificato il soggiorno nell'appartamento {room or 'Janara'}, "
+            "ma non ho ancora le istruzioni verificate per questo servizio. "
+            "Per favore chiedi allo staff Janara le informazioni specifiche."
+        )
+
+    if any(x in lower for x in (
+        "conferm", "quando", "date", "data", "check-in", "check in",
+        "check-out", "check out", "arrivo", "partenza", "prenotazione", "soggiorno"
+    )):
+        return (
+            f"Ho verificato la prenotazione {booking_id}"
+            + (f" per l'appartamento {room}" if room else "")
+            + "."
+            + (f"\nCheck-in: {checkin}." if checkin else "")
+            + (f"\nCheck-out: {checkout}." if checkout else "")
+        )
+
+    if any(x in lower for x in ("ciao", "salve", "buongiorno", "buonasera", "buondi")):
+        return (
+            f"Ciao! Ho riconosciuto la prenotazione Janara {booking_id}"
+            + (f" per {room}" if room else "")
+            + ". Puoi chiedermi le date del soggiorno o le informazioni disponibili."
+        )
+
     return (
-        "Benvenuto! " + stay +
-        "\nSei già registrato come ospite: non devi effettuare una nuova prenotazione."
-        "\nPuoi scrivere qui la tua domanda sul soggiorno. "
-        "Per informazioni operative non ancora disponibili, contatta lo staff Janara."
+        "Ho riconosciuto la tua prenotazione Janara, ma non ho ancora "
+        "un'informazione verificata per rispondere a questa domanda. "
+        "Puoi specificare di cosa hai bisogno? "
+        "Se e' una richiesta operativa, serve l'assistenza dello staff Janara."
     )
 
 
