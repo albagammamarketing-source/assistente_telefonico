@@ -8,6 +8,7 @@ Quando cambia il materiale Drive, aggiornare questa mappatura.
 """
 import re
 import unicodedata
+from urllib.parse import quote
 
 STANDARD_CHECKIN = "16:00"
 STANDARD_CHECKOUT = "10:30"
@@ -69,13 +70,20 @@ def guest_room_info(room):
     return value
 
 def guest_room_directions(room):
+    """STEP 1 solamente: posizione Google Maps. Video nei passi successivi."""
     info = guest_room_info(room)
-    if not info:
-        return "Non ho ancora istruzioni verificate per questo alloggio. Contatta lo staff Janara."
-    lines = []
-    if info.get("address"):
-        lines.append("Indirizzo indicativo: " + info["address"] + ".")
-    for label, url in info.get("videos", []):
-        lines.append(label + ": " + url)
-    lines.append("Per il punto di ingresso e gli eventuali codici, fai riferimento alle istruzioni dello staff.")
-    return "\n".join(lines)
+    if not info or not info.get("address"):
+        return (
+            "STEP 1 - Posizione: non ho una posizione verificata per questo appartamento. "
+            "Contatta lo staff Janara prima di partire."
+        )
+    address = info["address"].split(" (")[0]
+    # Link di ricerca indirizzo su Google Maps; non rappresenta un pin GPS verificato.
+    maps_url = "https://www.google.com/maps/search/?api=1&query=" + quote(address)
+    return (
+        "STEP 1 - POSIZIONE GOOGLE MAPS\n"
+        f"Ecco l'indirizzo della tua struttura: {address}.\n"
+        f"Apri la posizione su Google Maps: {maps_url}\n"
+        "Quando hai visualizzato la posizione scrivimi 'POSIZIONE OK'. "
+        "Ti guidero' al passaggio successivo."
+    )
