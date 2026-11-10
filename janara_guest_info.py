@@ -63,36 +63,47 @@ def _room_key(room):
             return key
     return ""
 
-def guest_room_info(room):
+def guest_room_info(room, route=None):
     key = _room_key(room)
     value = ROOMS.get(key, {})
     if "alias" in value:
         value = ROOMS.get(value["alias"], {})
-    return value
+    if not route:
+        return value
+    videos = {kind: (label, url) for kind, label, url in value.get("videos", ())}
+    videos.update(route.get("videos", {}))
+    return {
+        **value,
+        "maps_url": route.get("maps_url") or value.get("maps_url"),
+        "videos": [(kind, label, url) for kind, (label, url) in videos.items()],
+    }
 
 ARRIVAL_QUESTION = "Come arriverai? Rispondi «in auto» oppure «a piedi»."
 
 
-def guest_room_directions(room):
-    info = guest_room_info(room)
-    if not info or not info.get("address"):
+def guest_room_directions(room, route=None):
+    info = guest_room_info(room, route)
+    if not info.get("address") and not info.get("maps_url"):
         return (
             "STEP 1 - Posizione: non ho una posizione verificata per questo appartamento. "
             "Contatta lo staff Janara prima di partire."
         )
-    address = info["address"].split(" (")[0]
+    address = info.get("address", "").split(" (")[0]
+    detail = f"Ecco la posizione di {room}.\n" if route and route.get("maps_url") else (
+        f"Ecco l'indirizzo della tua struttura: {address}.\n"
+    )
     maps_url = info.get("maps_url") or "https://www.google.com/maps/search/?api=1&query=" + quote(address)
     return (
         "📍 STEP 1 - Posizione Google Maps\n"
-        f"Ecco l'indirizzo della tua struttura: {address}.\n"
-        f"{maps_url}\n\n{ARRIVAL_QUESTION}"
+        + detail
+        + f"{maps_url}\n\n{ARRIVAL_QUESTION}"
     )
 
 
-def guest_arrival_reply(room, message):
+def guest_arrival_reply(room, message, route=None):
     """Risponde con il video pertinente alla richiesta dell'ospite verificato."""
     message = " ".join(re.sub(r"[^\w\s]", " ", message.lower()).split())
-    info = guest_room_info(room)
+    info = guest_room_info(room, route)
     videos = info.get("videos", [])
 
     if re.search(r"\bself check\s*in\b", message):
@@ -110,7 +121,7 @@ def guest_arrival_reply(room, message):
         return ARRIVAL_QUESTION
     if not walking and not driving:
         if re.search(r"\bvideo\b", message):
-            return guest_room_directions(room)
+            return guest_room_directions(room, route)
         return ""
 
     mode = "walking" if walking else "driving"
