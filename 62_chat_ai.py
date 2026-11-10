@@ -7,7 +7,7 @@ import base64
 from xml.sax.saxutils import escape
 from urllib.parse import parse_qs
 from janara_guest_lookup import extract_booking_id, recognize_guest
-from janara_guest_info import STANDARD_CHECKIN, STANDARD_CHECKOUT, guest_room_directions
+from janara_guest_info import STANDARD_CHECKIN, STANDARD_CHECKOUT, guest_arrival_reply, guest_room_directions
 from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
@@ -2015,7 +2015,11 @@ def guest_stay_reply(guest: dict, incoming_message: str) -> str:
               "Per eventuali eccezioni e istruzioni di accesso specifiche verifica con lo staff Janara."
         )
 
-    if any(x in lower for x in ("indicaz", "arrivare", "come raggiung", "indirizz", "dove si trova", "dove siete", "mappa", "self check-in", "self check in")):
+    arrival_reply = guest_arrival_reply(room, lower)
+    if arrival_reply:
+        return arrival_reply
+
+    if any(x in lower for x in ("indicaz", "arrivare", "come raggiung", "indirizz", "dove si trova", "dove siete", "mappa", "posizione", "google maps")):
         return guest_room_directions(room)
 
     if any(x in lower for x in ("numero", "telefono", "contatt", "chiamare", "assistenza", "staff")):
