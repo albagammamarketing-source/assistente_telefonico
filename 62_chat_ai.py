@@ -1990,6 +1990,35 @@ def annotate_whatsapp_guest_session(from_number: str, incoming_message: str):
         print("Riconoscimento Janara ambiguo: necessaria conferma ID prenotazione")
 
 
+def guest_stay_reply(guest: dict, incoming_message: str) -> str:
+    """Risposta separata per ospiti riconosciuti, senza inventare informazioni."""
+    name = (guest.get("name") or "").strip()
+    room = (guest.get("room") or "").strip()
+    checkin = (guest.get("arrival") or "").strip()
+    checkout = (guest.get("departure") or "").strip()
+    booking_id = (guest.get("booking_id") or "").strip()
+    lower = (incoming_message or "").strip().lower()
+    if any(word in lower for word in ("nuova prenotazione", "vorrei prenotare", "prenotare un altro", "altro appartamento")):
+        return ""  # Richiesta esplicita di nuova prenotazione: usa il flusso esistente.
+    stay = f"Ho trovato la tua prenotazione Janara {booking_id}"
+    if room:
+        stay += f" per l'appartamento {room}"
+    stay += "."
+    if any(word in lower for word in ("conferm", "quando", "date", "data", "check-in", "check in", "check-out", "check out", "arrivo", "partenza")):
+        if checkin:
+            stay += f"\nCheck-in: {checkin}."
+        if checkout:
+            stay += f"\nCheck-out: {checkout}."
+        stay += "\nPer orari e istruzioni di accesso specifiche serve la conferma dello staff Janara."
+        return stay
+    return (
+        "Benvenuto! " + stay +
+        "\nSei già registrato come ospite: non devi effettuare una nuova prenotazione."
+        "\nPuoi scrivere qui la tua domanda sul soggiorno. "
+        "Per informazioni operative non ancora disponibili, contatta lo staff Janara."
+    )
+
+
 def get_whatsapp_session(from_number: str) -> dict:
     key = str(from_number or "unknown").strip()
 
@@ -3199,14 +3228,29 @@ async def whatsapp_webhook(request: Request):
         # Riconoscimento in sola lettura: non altera la risposta attuale.
         annotate_whatsapp_guest_session(from_number, incoming_message)
 
-        # Gestione messaggio WhatsApp.
-        # Questa funzione deve accettare anche media_url e media_content_type.
-        reply = handle_whatsapp_message(
-            from_number=from_number,
-            incoming_message=incoming_message,
-            media_url=media_url,
-            media_content_type=media_content_type
-        )
+        # Ospiti riconosciuti: non avviare il questionario nuove prenotazioni.
+        # Allegati, richieste esplicite di nuove prenotazioni e numeri non riconosciuti
+        # conservano il percorso prenotazioni esistente.
+        guest_session = WHATSAPP_SESSIONS.get(from_number, {})
+        guest_reply = ""
+        if (JANARA_GUEST_RECOGNITION_ENABLED
+                and guest_session.get("guest_identity_status") == "matched"
+                and num_media == 0):
+            guest_reply = guest_stay_reply({
+                "booking_id": guest_session.get("guest_booking_id"),
+                "room": guest_session.get("guest_room"),
+                "arrival": guest_session.get("guest_check_in"),
+                "departure": guest_session.get("guest_check_out"),
+            }, incoming_message)
+        if guest_reply:
+            reply = guest_reply
+        else:
+            reply = handle_whatsapp_message(
+                from_number=from_number,
+                incoming_message=incoming_message,
+                media_url=media_url,
+                media_content_type=media_content_type
+            )
 
         # Salvataggio log conversazione su Google Sheet
         try:
