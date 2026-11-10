@@ -1991,13 +1991,17 @@ def annotate_whatsapp_guest_session(from_number: str, incoming_message: str):
         print("Riconoscimento Janara ambiguo: necessaria conferma ID prenotazione")
 
 
-def guest_stay_reply(guest: dict, incoming_message: str) -> str:
+def guest_stay_reply(guest: dict, incoming_message: str, session: Optional[dict] = None) -> str:
     """Risposte per ospiti gia' verificati, usando solo informazioni disponibili."""
     room = (guest.get("room") or "").strip()
     checkin = (guest.get("arrival") or "").strip()
     checkout = (guest.get("departure") or "").strip()
     booking_id = (guest.get("booking_id") or "").strip()
     lower = (incoming_message or "").strip().lower()
+    previous_fallback = session.pop("guest_fallback_booking_id", None) if session is not None else None
+
+    if lower in {"reset", "ricomincia", "annulla"}:
+        return ""
 
     if any(x in lower for x in (
         "nuova prenotazione", "vorrei prenotare", "prenotare un altro",
@@ -2022,17 +2026,14 @@ def guest_stay_reply(guest: dict, incoming_message: str) -> str:
     if any(x in lower for x in ("indicaz", "arrivare", "come raggiung", "indirizz", "dove si trova", "dove siete", "mappa", "posizione", "google maps")):
         return guest_room_directions(room)
 
-    if any(x in lower for x in ("numero", "telefono", "contatt", "chiamare", "assistenza", "staff")):
-        return (
-            "Stai scrivendo al WhatsApp Janara 08241910020. "
-            "Non ho un altro recapito verificato dello staff da indicarti."
-        )
+    if is_operator_intent(lower) or any(x in lower for x in ("numero", "telefono", "contatt", "chiamare", "assistenza", "staff")):
+        return build_operator_reply()
 
     if any(x in lower for x in ("wifi", "wi-fi", "password", "parchegg", "chiavi", "codice porta", "accesso")):
         return (
             f"Ho identificato il soggiorno nell'appartamento {room or 'Janara'}, "
             "ma non ho ancora le istruzioni verificate per questo servizio. "
-            "Per favore chiedi allo staff Janara le informazioni specifiche."
+            f"Per assistenza, chiama o scrivi allo staff Janara al {WHATSAPP_OPERATOR_PHONE}."
         )
 
     if any(x in lower for x in (
@@ -2054,11 +2055,13 @@ def guest_stay_reply(guest: dict, incoming_message: str) -> str:
             + ". Puoi chiedermi le date del soggiorno o le informazioni disponibili."
         )
 
+    if session is not None:
+        session["guest_fallback_booking_id"] = booking_id
+    if previous_fallback == booking_id:
+        return f"Per questa richiesta ti può aiutare lo staff Janara. Chiama o scrivi al {WHATSAPP_OPERATOR_PHONE}."
     return (
-        "Ho riconosciuto la tua prenotazione Janara, ma non ho ancora "
-        "un'informazione verificata per rispondere a questa domanda. "
-        "Puoi specificare di cosa hai bisogno? "
-        "Se e' una richiesta operativa, serve l'assistenza dello staff Janara."
+        "Non ho capito la richiesta. Puoi scrivere «come arrivare», «orario check-in» "
+        "o «date soggiorno». Se ti serve altro, scrivi «operatore»."
     )
 
 
@@ -3268,7 +3271,7 @@ async def whatsapp_webhook(request: Request):
             f"- content_type: {media_content_type}"
         )
 
-        # Riconoscimento in sola lettura: non altera la risposta attuale.
+        cleanup_whatsapp_sessions()
         annotate_whatsapp_guest_session(from_number, incoming_message)
 
         # Ospiti riconosciuti: non avviare il questionario nuove prenotazioni.
@@ -3284,8 +3287,9 @@ async def whatsapp_webhook(request: Request):
                 "room": guest_session.get("guest_room"),
                 "arrival": guest_session.get("guest_check_in"),
                 "departure": guest_session.get("guest_check_out"),
-            }, incoming_message)
+            }, incoming_message, guest_session)
         if guest_reply:
+            guest_session["last_updated"] = datetime.utcnow().isoformat()
             reply = guest_reply
         else:
             reply = handle_whatsapp_message(
