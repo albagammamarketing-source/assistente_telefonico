@@ -6,6 +6,7 @@ import re
 import base64
 from xml.sax.saxutils import escape
 from urllib.parse import parse_qs
+from janara_guest_lookup import recognize_guest
 from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
@@ -184,6 +185,18 @@ if OPENAI_API_KEY and OpenAI is not None:
 # Memoria conversazionale semplice per numero WhatsApp.
 # Nota: su Render questa memoria è volatile e si resetta a ogni deploy/riavvio.
 WHATSAPP_SESSIONS: Dict[str, dict] = {}
+
+# Riconoscimento ospiti Janara: feature flag disattivato per default.
+# Il registro prenotazioni con ID JNR e' separato da PRENOTAZIONI_AI.
+JANARA_GUEST_RECOGNITION_ENABLED = os.environ.get(
+    "JANARA_GUEST_RECOGNITION_ENABLED", "0"
+).strip() == "1"
+JANARA_GUEST_SHEET_ID = os.environ.get(
+    "JANARA_GUEST_SHEET_ID", "1DzP9o98cV6w0_wz581E8MgWt7iOFOr9gJ2wuVaZPV98"
+)
+JANARA_GUEST_SHEET_TAB = os.environ.get("JANARA_GUEST_SHEET_TAB", "check IN JAnara")
+_guest_lookup_cache = {"at": 0.0, "rows": None}
+
 
 
 http = requests.Session()
@@ -1927,6 +1940,54 @@ def calculate_nights(check_in: str, check_out: str) -> int:
         return 0
 
 
+def get_janara_guest_snapshot():
+    """Legge solo colonne necessarie del foglio Janara; cache breve."""
+    now = time.monotonic()
+    cached = _guest_lookup_cache["rows"]
+    if cached is not None and now - _guest_lookup_cache["at"] < 120:
+        return cached
+    tab = JANARA_GUEST_SHEET_TAB.replace("'", "''")
+    result = get_sheets_service().spreadsheets().values().batchGet(
+        spreadsheetId=JANARA_GUEST_SHEET_ID,
+        ranges=[f"'{tab}'!C1:K", f"'{tab}'!AY1:AY"],
+        valueRenderOption="FORMATTED_VALUE",
+    ).execute()
+    ranges = result.get("valueRanges", [])
+    if len(ranges) != 2:
+        raise RuntimeError("Intervalli prenotazioni Janara non disponibili")
+    core = ranges[0].get("values", [])
+    ids = ranges[1].get("values", [])
+    rows = []
+    for i in range(max(len(core), len(ids))):
+        first = list(core[i]) if i < len(core) else []
+        first += [""] * (9 - len(first))
+        rows.append(first[:9] + [ids[i][0] if i < len(ids) and ids[i] else ""])
+    _guest_lookup_cache.update({"at": now, "rows": rows})
+    return rows
+
+
+def annotate_whatsapp_guest_session(from_number: str, incoming_message: str):
+    """Solo classificazione; NON cambia il flusso esistente delle prenotazioni."""
+    if not JANARA_GUEST_RECOGNITION_ENABLED:
+        return
+    try:
+        found = recognize_guest(get_janara_guest_snapshot(), from_number, incoming_message)
+    except Exception as error:
+        # Fallimento Google Sheets: prenotazioni esistenti continuano a funzionare.
+        print(f"Riconoscimento ospite Janara non disponibile: {type(error).__name__}")
+        return
+    session = get_whatsapp_session(from_number)
+    session["guest_identity_status"] = found["status"]
+    session["guest_booking_id"] = found.get("booking_id", "")
+    session["guest_room"] = found.get("room", "")
+    session["guest_check_in"] = found.get("arrival", "")
+    session["guest_check_out"] = found.get("departure", "")
+    if found["status"] == "matched":
+        print("Riconoscimento ospite Janara riuscito (senza dati personali nei log)")
+    elif found["status"] == "multiple":
+        print("Riconoscimento Janara ambiguo: necessaria conferma ID prenotazione")
+
+
 def get_whatsapp_session(from_number: str) -> dict:
     key = str(from_number or "unknown").strip()
 
@@ -3132,6 +3193,9 @@ async def whatsapp_webhook(request: Request):
             f"- media: {num_media} "
             f"- content_type: {media_content_type}"
         )
+
+        # Riconoscimento in sola lettura: non altera la risposta attuale.
+        annotate_whatsapp_guest_session(from_number, incoming_message)
 
         # Gestione messaggio WhatsApp.
         # Questa funzione deve accettare anche media_url e media_content_type.
