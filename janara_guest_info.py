@@ -15,34 +15,35 @@ STANDARD_CHECKOUT = "10:30"
 
 ROOMS = {
     "arechi": {"address": "Via Annunziata 71, Benevento", "videos": [
-        ("Video: arrivo dal civico 78", "https://drive.google.com/file/d/1-eb2AJTMj4T9OPBSQlbUzgbVxq4M91BI/view"),
-        ("Video: percorso a piedi da Piazza Castello", "https://drive.google.com/file/d/100pXPGE4EHWYr6FPQ0EMA8cgmIWsUByg/view"),
+        ("entrance", "Video: arrivo dal civico 78", "https://drive.google.com/file/d/1-eb2AJTMj4T9OPBSQlbUzgbVxq4M91BI/view"),
+        ("walking", "Video: percorso a piedi da Piazza Castello", "https://drive.google.com/file/d/100pXPGE4EHWYr6FPQ0EMA8cgmIWsUByg/view"),
     ]},
     "iside": {"address": "Via Annunziata 71, Benevento", "videos": [
-        ("Video: arrivo dal civico 78", "https://drive.google.com/file/d/1-eb2AJTMj4T9OPBSQlbUzgbVxq4M91BI/view"),
-        ("Video: percorso a piedi da Piazza Castello", "https://drive.google.com/file/d/100pXPGE4EHWYr6FPQ0EMA8cgmIWsUByg/view"),
+        ("entrance", "Video: arrivo dal civico 78", "https://drive.google.com/file/d/1-eb2AJTMj4T9OPBSQlbUzgbVxq4M91BI/view"),
+        ("walking", "Video: percorso a piedi da Piazza Castello", "https://drive.google.com/file/d/100pXPGE4EHWYr6FPQ0EMA8cgmIWsUByg/view"),
     ]},
     "santa sofia": {"address": "Via Annunziata 48, Benevento", "videos": [
-        ("Video: Casa parrocchiale", "https://drive.google.com/file/d/10G8tKYpISBLJ7dwG4Wrnz9cNfb9qlNqP/view"),
-        ("Video: percorso Santa Rita–Santa Sofia", "https://drive.google.com/file/d/105o80nhMsVHWpLQNJt_jA1tlWRFOJywm/view"),
+        ("entrance", "Video: Casa parrocchiale", "https://drive.google.com/file/d/10G8tKYpISBLJ7dwG4Wrnz9cNfb9qlNqP/view"),
+        ("walking", "Video: percorso Santa Rita–Santa Sofia", "https://drive.google.com/file/d/105o80nhMsVHWpLQNJt_jA1tlWRFOJywm/view"),
     ]},
-    "traiano": {"address": "Via Annunziata 71, Benevento (Arco di Traiano)", "videos": [
-        ("Video: arrivo in auto", "https://drive.google.com/file/d/1jqZyPoybhiV-PzwsI-TtCT4NAYooJ9rH/view"),
-        ("Video: self check-in da civico 78", "https://drive.google.com/file/d/1myqre9R_zJUBArtt1LRcwtZ-jh3wExDj/view"),
-        ("Video: istruzioni self check-in", "https://drive.google.com/file/d/1whM4BxVUj6CjfzF6-5pzpVYyH3P9oCe5/view"),
+    "traiano": {"address": "Via Annunziata 71, Benevento (Arco di Traiano)",
+        "maps_url": "https://maps.app.goo.gl/SitT87r3nKhofLMc6", "videos": [
+        ("driving", "Video: arrivo in auto", "https://drive.google.com/file/d/1jqZyPoybhiV-PzwsI-TtCT4NAYooJ9rH/view"),
+        ("entrance", "Video: self check-in da civico 78", "https://drive.google.com/file/d/1myqre9R_zJUBArtt1LRcwtZ-jh3wExDj/view"),
+        ("checkin", "Video: istruzioni self check-in", "https://drive.google.com/file/d/1whM4BxVUj6CjfzF6-5pzpVYyH3P9oCe5/view"),
     ]},
     "arco di traiano": {"alias": "traiano"},
     "port arsa": {"address": "Via Port'arsa 10, Benevento", "videos": [
-        ("Video: Teatro Romano – Port'Arsa", "https://drive.google.com/file/d/1nmMujPZiOhtr9Wy0zE_D8nEOR_CmfZh2/view"),
+        ("general", "Video: Teatro Romano – Port'Arsa", "https://drive.google.com/file/d/1nmMujPZiOhtr9Wy0zE_D8nEOR_CmfZh2/view"),
     ]},
     "duomo": {"address": "Vico 3 Triggio 10, Benevento", "videos": [
-        ("Video: Duomo e Teatro Romano", "https://drive.google.com/file/d/1u1mft-AJtdiifUll3Won-mlP5IiLPH-2/view"),
+        ("general", "Video: Duomo e Teatro Romano", "https://drive.google.com/file/d/1u1mft-AJtdiifUll3Won-mlP5IiLPH-2/view"),
     ]},
     "teatro romano": {"address": "Vico 3 Triggio 10, Benevento", "videos": [
-        ("Video: Duomo e Teatro Romano", "https://drive.google.com/file/d/1u1mft-AJtdiifUll3Won-mlP5IiLPH-2/view"),
+        ("general", "Video: Duomo e Teatro Romano", "https://drive.google.com/file/d/1u1mft-AJtdiifUll3Won-mlP5IiLPH-2/view"),
     ]},
     "mura longobarde": {"address": "Via Tommaso Rossi, Benevento", "videos": [
-        ("Video: come arrivare", "https://drive.google.com/file/d/15iO01mfCM9oCMF4AVQcdUq5bFMQPy7_l/view"),
+        ("general", "Video: come arrivare", "https://drive.google.com/file/d/15iO01mfCM9oCMF4AVQcdUq5bFMQPy7_l/view"),
     ]},
 }
 
@@ -69,8 +70,10 @@ def guest_room_info(room):
         value = ROOMS.get(value["alias"], {})
     return value
 
+ARRIVAL_QUESTION = "Come arriverai? Rispondi «in auto» oppure «a piedi»."
+
+
 def guest_room_directions(room):
-    """STEP 1 solamente: posizione Google Maps. Video nei passi successivi."""
     info = guest_room_info(room)
     if not info or not info.get("address"):
         return (
@@ -78,11 +81,48 @@ def guest_room_directions(room):
             "Contatta lo staff Janara prima di partire."
         )
     address = info["address"].split(" (")[0]
-    # Link di ricerca indirizzo su Google Maps; non rappresenta un pin GPS verificato.
-    maps_url = "https://www.google.com/maps/search/?api=1&query=" + quote(address)
+    maps_url = info.get("maps_url") or "https://www.google.com/maps/search/?api=1&query=" + quote(address)
     return (
-        "STEP 1 - POSIZIONE GOOGLE MAPS\n"
+        "📍 STEP 1 - Posizione Google Maps\n"
         f"Ecco l'indirizzo della tua struttura: {address}.\n"
-        f"Apri la posizione su Google Maps: {maps_url}\n"
-        "Questo e' il primo passaggio. Le istruzioni successive saranno inviate separatamente."
+        f"{maps_url}\n\n{ARRIVAL_QUESTION}"
     )
+
+
+def guest_arrival_reply(room, message):
+    """Risponde con il video pertinente alla richiesta dell'ospite verificato."""
+    message = " ".join(re.sub(r"[^\w\s]", " ", message.lower()).split())
+    info = guest_room_info(room)
+    videos = info.get("videos", [])
+
+    if re.search(r"\bself check\s*in\b", message):
+        video = next(((label, url) for kind, label, url in videos if kind == "checkin"), None)
+        if video:
+            label, url = video
+            return f"🎥 {label.removeprefix('Video: ')}\n{url}"
+        return "Per le istruzioni di self check-in del tuo appartamento, contatta lo staff Janara."
+
+    walking = bool(re.search(r"\ba piedi\b", message))
+    driving = message in {"auto", "macchina", "automobile"} or bool(
+        re.search(r"\bin (?:auto|macchina|automobile)\b", message)
+    )
+    if walking and (driving or re.search(r"\b(?:auto|macchina|automobile)\b", message)):
+        return ARRIVAL_QUESTION
+    if not walking and not driving:
+        if re.search(r"\bvideo\b", message):
+            return guest_room_directions(room)
+        return ""
+
+    mode = "walking" if walking else "driving"
+    video = next(((label, url) for kind, label, url in videos if kind == mode), None)
+    if video is None:
+        video = next(((label, url) for kind, label, url in videos if kind == "general"), None)
+    if video is None:
+        video = next(((label, url) for kind, label, url in videos if kind == "entrance"), None)
+    if video is None:
+        return "Per un video adatto al tuo percorso, chiedi allo staff Janara."
+    label, url = video
+    reply = f"🎥 {label.removeprefix('Video: ')}\n{url}"
+    if any(kind == "checkin" for kind, _, _ in videos):
+        reply += "\n\nPer il video di accesso, scrivi «self check-in»."
+    return reply
