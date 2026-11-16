@@ -3318,6 +3318,34 @@ def handle_whatsapp_message(
     return build_guests_menu()
 
 # =========================
+# CONTESTO PRENOTAZIONI WHATSAPP
+# =========================
+
+def janara_booking_intent(message: str) -> str:
+    """Distingue richiesta nuova da assistenza su prenotazione esistente.
+    Un numero di telefono non identifica da solo il soggiorno a cui ci si riferisce.
+    """
+    text = normalize_for_match(str(message or ""))
+    if re.search(
+        r"\b(?:nuova? prenotazion\w*|nuovo soggiorno|riprenot\w*|"
+        r"prenotare (?:di nuovo|nuovamente|ancora|un altro)|"
+        r"tornare (?:a soggiornare|da voi)|"
+        r"vorrei prenotare|voglio prenotare|"
+        r"disponibilita (?:per|dal|a)|avete disponibilita)\b",
+        text,
+    ):
+        return "new_booking"
+    if extract_booking_id(message) or re.search(
+        r"\b(?:ho (?:gia )?una prenotazione|mia prenotazione|"
+        r"prenotazione esistente|prenotazione che ho fatto|"
+        r"mio soggiorno prenotato)\b",
+        text,
+    ):
+        return "existing_booking"
+    return ""
+
+
+# =========================
 # ENDPOINT WHATSAPP / TWILIO
 # =========================
 
@@ -3375,32 +3403,55 @@ async def whatsapp_webhook(request: Request):
         )
 
         cleanup_whatsapp_sessions()
-        annotate_whatsapp_guest_session(from_number, incoming_message)
-
-        # Ospiti riconosciuti: non avviare il questionario nuove prenotazioni.
-        # Allegati, richieste esplicite di nuove prenotazioni e numeri non riconosciuti
-        # conservano il percorso prenotazioni esistente.
-        guest_session = WHATSAPP_SESSIONS.get(from_number, {})
-        guest_reply = ""
-        if (JANARA_GUEST_RECOGNITION_ENABLED
-                and guest_session.get("guest_identity_status") == "matched"
-                and num_media == 0):
-            guest_reply = await guest_stay_reply({
-                "booking_id": guest_session.get("guest_booking_id"),
-                "room": guest_session.get("guest_room"),
-                "arrival": guest_session.get("guest_check_in"),
-                "departure": guest_session.get("guest_check_out"),
-            }, incoming_message, guest_session)
-        if guest_reply:
-            guest_session["last_updated"] = datetime.utcnow().isoformat()
-            reply = guest_reply
-        else:
-            reply = handle_whatsapp_message(
-                from_number=from_number,
-                incoming_message=incoming_message,
-                media_url=media_url,
-                media_content_type=media_content_type
+        booking_intent = janara_booking_intent(incoming_message) if num_media == 0 else ""
+        # Un nuovo soggiorno non deve mai ereditare date, alloggio o stato
+        # della prenotazione precedente, anche se il telefono e' gia' censito.
+        if booking_intent == "new_booking":
+            reset_whatsapp_session(from_number)
+            guest_session = get_whatsapp_session(from_number)
+            guest_session["conversation_intent"] = "new_booking"
+            reply = "Certamente, iniziamo una nuova prenotazione.\n\n" + build_guests_menu()
+        elif booking_intent == "existing_booking" and not extract_booking_id(incoming_message):
+            guest_session = get_whatsapp_session(from_number)
+            guest_session["conversation_intent"] = "existing_booking"
+            reply = (
+                "Per aiutarti con un soggiorno gia' prenotato, scrivi il codice "
+                "della prenotazione (es. JNR-...). Se non lo trovi, scrivi «operatore»."
             )
+        else:
+            guest_session = get_whatsapp_session(from_number)
+            if booking_intent == "existing_booking":
+                guest_session["conversation_intent"] = "existing_booking"
+            if guest_session.get("conversation_intent") != "new_booking":
+                annotate_whatsapp_guest_session(from_number, incoming_message)
+            guest_reply = ""
+            if (JANARA_GUEST_RECOGNITION_ENABLED
+                    and guest_session.get("conversation_intent") != "new_booking"
+                    and guest_session.get("guest_identity_status") == "matched"
+                    and num_media == 0):
+                guest_reply = await guest_stay_reply({
+                    "booking_id": guest_session.get("guest_booking_id"),
+                    "room": guest_session.get("guest_room"),
+                    "arrival": guest_session.get("guest_check_in"),
+                    "departure": guest_session.get("guest_check_out"),
+                }, incoming_message, guest_session)
+            if guest_reply:
+                guest_session["last_updated"] = datetime.utcnow().isoformat()
+                reply = guest_reply
+            elif (booking_intent == "existing_booking"
+                    and JANARA_GUEST_RECOGNITION_ENABLED
+                    and guest_session.get("guest_identity_status") != "matched"):
+                reply = (
+                    "Non riesco a verificare questa prenotazione con il numero "
+                    "WhatsApp usato. Per sicurezza scrivi «operatore»."
+                )
+            else:
+                reply = handle_whatsapp_message(
+                    from_number=from_number,
+                    incoming_message=incoming_message,
+                    media_url=media_url,
+                    media_content_type=media_content_type
+                )
 
         # Salvataggio log conversazione su Google Sheet
         try:
