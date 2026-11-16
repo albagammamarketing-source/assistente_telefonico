@@ -90,6 +90,22 @@ def parse_guest_workbook(content):
             if room and network and password and all(value.isprintable() for value in (network, password)):
                 wifi[room_key(room)] = (network, password)
 
+        accommodation = {}
+        for room, address, checkin, checkout, parking, access, climate, state in sheet_rows(book, "ALLOGGI", (
+            "nome alloggio", "indirizzo completo", "check in standard", "check out standard",
+            "parcheggio", "istruzioni accesso link sicuro", "clima riscaldamento", "stato dati"
+        )):
+            if normalize(state) not in APPROVED or not room:
+                continue
+            values = {
+                "indirizzo": address, "check_in": checkin, "check_out": checkout,
+                "parcheggio": parking, "accesso": access, "clima": climate,
+            }
+            accommodation[room_key(room)] = {
+                key: value for key, value in values.items()
+                if value and normalize(value) not in {"da compilare", "da verificare", "da confermare"}
+            }
+
         routes = {}
         single_room_maps = {}
         for apartment, description, video, maps in sheet_rows(book, "come arrivare video", (
@@ -116,7 +132,7 @@ def parse_guest_workbook(content):
 
         for room, url in single_room_maps.items():
             routes[room]["maps_url"] = url
-        return {"faq": faq, "wifi": wifi, "routes": routes}
+        return {"faq": faq, "wifi": wifi, "routes": routes, "accommodation": accommodation}
     finally:
         book.close()
 
@@ -134,3 +150,29 @@ def get_guest_knowledge(download):
             _REFRESH_AT = monotonic() + 30
             print(f"Workbook Janara non disponibile: {type(error).__name__}")
         return _CACHE
+
+
+def retrieve_guest_sources(workbook, room, message, history):
+    """Recupera fonti dell'alloggio e FAQ, considerando anche le domande precedenti."""
+    key = room_key(room)
+    terms = set(normalize(message + " " + " ".join(
+        item.get("content", "") for item in history[-4:] if item.get("role") == "user"
+    )).split())
+    candidates = [row for row in workbook.get("faq", ()) if row[3] in {"tutti", key}]
+    def score(row):
+        return len(terms & set(normalize(row[1] + " " + row[2]).split()))
+    ranked = sorted(candidates, key=score, reverse=True)
+    sources = []
+    budget = 14000
+    for identifier, question, answer, scope in ranked:
+        size = len(question) + len(answer)
+        if size > budget:
+            continue
+        sources.append({"fonte": "FAQ/" + identifier, "domanda": question, "risposta": answer})
+        budget -= size
+    return {
+        "faq": sources,
+        "alloggio": workbook.get("accommodation", {}).get(key, {}),
+        "fonte_alloggio": "ALLOGGI/" + room,
+        "workbook_disponibile": bool(workbook),
+    }

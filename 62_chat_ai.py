@@ -8,8 +8,8 @@ import base64
 from xml.sax.saxutils import escape
 from urllib.parse import parse_qs
 from janara_guest_lookup import extract_booking_id, recognize_guest
-from janara_guest_info import STANDARD_CHECKIN, STANDARD_CHECKOUT, guest_arrival_reply, guest_room_directions
-from janara_knowledge import get_guest_knowledge, room_key as knowledge_room_key
+from janara_guest_info import STANDARD_CHECKIN, STANDARD_CHECKOUT, guest_arrival_reply, guest_room_directions, guest_room_info
+from janara_knowledge import get_guest_knowledge, retrieve_guest_sources, room_key as knowledge_room_key
 from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
@@ -2054,12 +2054,21 @@ def generate_guest_answer(message: str, facts: dict, history: list) -> str:
                         "inserisci su una riga separata il segnaposto [[WIFI]], solo se richiesto "
                         "o necessario per una domanda sulla connessione. "
                         "Non ricominciare il benvenuto a ogni risposta. "
+                        "Se chiede informazioni generali, presenta brevemente il soggiorno e le "
+                        "informazioni utili presenti nelle fonti, poi offri un seguito pertinente. "
+                        "Se risponde con poche parole come dalla stazione, con un taxi, "
+                        "o e poi, usa il dialogo per capire la richiesta. Per percorsi specifici "
+                        "non documentati nelle fonti, comunica la posizione e chiedi solo il "
+                        "dettaglio necessario, senza inventare fermate, distanze o tariffe. "
+                        "Usa i dati della scheda ALLOGGI come riferimento specifico quando "
+                        "disponibili. Non menzionare fogli Excel, nomi di file, classificazioni "
+                        "o fonti interne all'ospite. "
                         "Fonti disponibili:\n" + json.dumps(facts, ensure_ascii=False)
                     ),
                 },
                 *[
                     {"role": entry["role"], "content": redact(entry["content"])}
-                    for entry in history[-8:]
+                    for entry in history[-16:]
                     if entry.get("role") in {"user", "assistant"}
                 ],
                 {"role": "user", "content": redact(message)},
@@ -2157,11 +2166,24 @@ async def guest_stay_reply(guest: dict, incoming_message: str, session: dict) ->
         session["guest_history"] = []
         session["guest_history_booking_id"] = booking_id
     history = session.setdefault("guest_history", [])
-    facts = {key: value for key, value in answers.items() if key != "wifi" and value}
+    sources = retrieve_guest_sources(workbook, room, incoming_message, history)
+    info = guest_room_info(room, route)
+    facts = {
+        "soggiorno": {"alloggio": room, "arrivo": arrival, "partenza": departure},
+        "orari_standard": {
+            "check_in": sources["alloggio"].get("check_in") or STANDARD_CHECKIN,
+            "check_out": sources["alloggio"].get("check_out") or STANDARD_CHECKOUT,
+        },
+        "posizione": (route or {}).get("maps_url") or info.get("maps_url") or answers["location"],
+        "video": [
+            {"tipo": kind, "descrizione": label, "link": url}
+            for kind, label, url in info.get("videos", ())
+        ],
+        "fonti_excel": sources,
+        "contatto_staff": WHATSAPP_OPERATOR_PHONE,
+    }
     if wifi:
         facts["wifi"] = "Credenziali disponibili per questo alloggio. Usa [[WIFI]] se richieste."
-    for key, (question, answer) in faq.items():
-        facts[key] = {"domanda": question, "risposta": answer}
     if topics == ["staff"]:
         generated = answers["staff"]
     elif topics == ["wifi"] and wifi:
@@ -2183,12 +2205,17 @@ async def guest_stay_reply(guest: dict, incoming_message: str, session: dict) ->
             {"role": "user", "content": incoming_message[:1200].replace(wifi[1], "[credenziali omesse]") if wifi else incoming_message[:1200]},
             {"role": "assistant", "content": remembered[:1800]},
         ])
-        session["guest_history"] = history[-8:]
+        session["guest_history"] = history[-16:]
         session.pop("guest_fallback_booking_id", None)
         return generated
 
     topics = topics or []
     replies = [answers[topic] for topic in topics if answers.get(topic)]
+    history.extend([
+        {"role": "user", "content": incoming_message[:1200].replace(wifi[1], "[credenziali omesse]") if wifi else incoming_message[:1200]},
+        {"role": "assistant", "content": "Serve chiarire questa richiesta o verificarla con lo staff."},
+    ])
+    session["guest_history"] = history[-16:]
     previous_fallback = session.pop("guest_fallback_booking_id", None)
     if topics and all(answers.get(topic) for topic in topics):
         return "\n\n".join(dict.fromkeys(replies))
